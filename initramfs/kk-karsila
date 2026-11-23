@@ -1,0 +1,8 @@
+#!/bin/sh
+# Kara Kutu G32: telnetd (-l) karşılama programı. İlk satır kk-anahat betiğinin doğruladığı imza satırıdır.
+export PATH=/bin
+export PS1='kk-anahat# '
+echo "KK-ANAHAT G34 | uname=$(uname -r) | host=$(uname -n) | 172.16.42.1:2323"
+echo "Kara Kutu ana hat (6.12) - kurtarma ortami DEGIL. eMMC salt okuma (kati mod), /dev/mem yok."
+echo "Cikis: /bin/kk-reboot2 bootloader | init oturum siniri: $(cat /kk-oturum 2>/dev/null) sn uptime"
+exec /bin/sh

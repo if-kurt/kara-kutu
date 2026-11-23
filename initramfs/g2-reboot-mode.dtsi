@@ -1,0 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0
+/* G57 G-2 önerisi — ONAY BEKLİYOR (O-G2-1: PMIC 0x1E1'e iki yeni değer). Cihaz imajına yalnız ayrı bir build.sh
+ * varyantıyla ve onaydan sonra girer. Yazma yolu DEĞİŞMEZ (syscon-reboot-mode, kk-spmi-syscon W11: yazılabilir
+ * yalnız 0x1E1 ve 0x3E). Değerler 4.9 ile aynı (refs/android_kernel_huawei_kirin710):
+ *   bootloader 0x01 (mevcut), erecovery 0x08 (mntn_public_interface.h:202), normal 0x10 = COLDBOOT (…:209;
+ *   hisi_poweroff.c:97-99 parametresiz reboot -> "COLDBOOT"; bootloader'ın kendi "fastboot reboot" değeri).
+ * 0x00 (AP_S_COLDBOOT) KULLANILAMAZ: reboot-mode.c magic 0'ı hiç yazmaz.
+ * Yan etki: mode-normal, komutsuz restart'a ek olarak poweroff/halt'ta da yazılır (reboot_mode_notify her olayda çalışır).
+ */
+&{/soc/spmi@fff24000/pmic@0/reboot-mode} {
+	mode-erecovery = <0x08>;
+	mode-normal = <0x10>;
+};

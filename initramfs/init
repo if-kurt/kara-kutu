@@ -1,0 +1,585 @@
+#!/bin/sh
+# Kara Kutu G33 — ana hat: G32 (eMMC SALT OKUMA + USB NCM + telnet 2323) + Debian'ı SALT OKUNUR açma.
+# eMMC'ye yazma yok: kkdata (userdata, ext4) "ro,noload" bağlanır (journal replay yok); Debian dizini overlay'in
+# ALT katmanı, üst katman ve work 256 MiB tmpfs'te. switch_root bu overlay'e. Karta yazma kernel'de de engelli
+# (mmc core kk_mmc_filtre + CMD6 beyaz liste + katı mod; disk ro). /dev/mem yok.
+# Üst katman (init yazar): maskeler (kk-wifi, kk-charge, kk-clock*, kk-ekran, kk-bootok, timesyncd,
+#   systemd-pstore, apt/man-db/dpkg/e2scrub/fstrim zamanlayıcıları, wpa_supplicant), sshd YALNIZ 2222,
+#   G37: chrony maskesiz (drift/log üst katmana; rtcsync alt katmanda kapalı, ana hatta RTC sürücüsü yok);
+#   usb0'a (10-kk-usb.network drop-in) Gateway=172.16.42.2 (ana makine NAT); DNS alt katmanın resolv.conf'u.
+#   hostname kk-anahat-debian, journald volatile + kmsg'ye, sysrq=0, reboot-param=bootloader,
+#   systemd RuntimeWatchdogSec=60s (NOWAYOUT kalır), oturum sınırı zamanlayıcısı (DEB_SINIR sn -> reboot bootloader).
+# Watchdog devri: initramfs besleyicisi durdurulur, init son kez besler (60 sn bütçe), systemd devralır.
+# Debian'a geçilemezse (geri dönüşsüz noktadan önce) init G32 gibi initramfs oturumunda kalır (telnet 2323,
+#   OTURUM sn'de reboot bootloader). cmdline kk_oturum= / kk_wd_sinir= / kk_debian_sinir= yalnız KISALTIR;
+#   kk_debian=0 Debian'ı atlar (yalnız atlatır). Bunlar cihazın DT bootargs'ında yok (QEMU sınaması).
+# G47 S2 (KV3/KV6): pstore bağlandıktan hemen sonra /bin/kk-idle-bekci karar (YALNIZ log; kmsg + pmsg; açma YOK).
+#   Üst katmana aynı bekçi + kk-idle-bekci.timer (OnBootSec=120s, aşamalı açma) + kk-idle-durum.timer (10 dk).
+# G57 G-1 (öneri): kk_gunluk=1 (yalnız günlük imajın DT bootargs'ı) -> Debian oturum sınırı zamanlayıcısı KURULMAZ; yerine
+#   sağlık bekçisi /bin/kk-saglik (kk-saglik.timer 30 sn + 60 sn). kk_gunluk yoksa üst katman G57 E6 init'iyle AYNI
+#   (sınır zamanlayıcısı, kk-saglik yok). initramfs oturumu (OTURUM) ve initramfs besleyicisinin sert sınırı (WD_SINIR)
+#   iki kipte de aynen (Debian'a geçilemezse eski yol). SP805 (systemd RuntimeWatchdogSec) ve çip WDT'si (çekirdek) aynen.
+# G58 G-1 (öneri): G-1K kısa oturum değişkesi. kk_gunluk=1 iken bootargs'ta kk_debian_sinir=<sn> AÇIKÇA verilmişse (G-1K: 1200)
+#   oturum sınırı zamanlayıcısı DA kurulur (D1 yerinde) ve kk-saglik aynen kurulur; kk_saglik_gozlem=1 bekçiyi gözlem kipine alır
+#   (bekçi okur; eylem yok). Güvenli düşüş: kk_saglik_gozlem=1 verilip kk_debian_sinir verilmemişse sınır DEB_SINIR (1740) ile
+#   kurulur (eylemsiz bekçi + sınırsız oturum olmaz). G-1U (kk_debian_sinir yok, gözlem yok) üst katmanı G57 G-1 ile AYNI.
+# G59-A (öneri): günlük imaj. kk_gunluk_sinir tavanı 604800 sn (7 gün; alt sınır 3600 aynen). Günlük kipte (GSV=1: yalnız kk_gunluk=1 +
+#   geçerli kk_gunluk_sinir + kk_debian_sinir YOK) sınır eylemi NORMAL reboot (`systemctl reboot normal` -> DT mode-normal 0x10 -> bootloader
+#   `kernel`'i = ana hattı yeniden açar). systemctl başarısızsa yedek: kk-alan kapat + busybox `reboot -f` (komutsuz RESTART -> kk-reset-nedeni/
+#   reboot-mode "normal" -> 0x10; kk-reboot2 yalnız "bootloader" kabul eder). kk_debian_sinir yolu (G-1K, D1 test imajları) ve kk-saglik eylemleri
+#   (bootloader) DEĞİŞMEDİ. GSV=0 iken üretilen sınır betiği/birimleri G58-D ile bayt bayt aynıdır.
+export PATH=/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+say() { echo "<4>kk: $*" > /dev/kmsg 2>/dev/null || echo "$*"; }
+up() { cut -d' ' -f1 /proc/uptime; }
+upi() { cut -d. -f1 /proc/uptime; }
+rd() { cat "$1" 2>/dev/null; }
+
+IP_DEV=172.16.42.1; MAC_DEV=02:4b:4b:00:00:01; MAC_HOST=02:4b:4b:00:00:02; PORT=2323
+OTURUM=840; WD_SINIR=900; DEB_SINIR=1740; DEBIAN=1
+# G52 E6 (öneri): kk_alan=1|ro yalnız AÇAR (cihazda yalnız DT bootargs'tan; bootloader eklemez). Yoksa bugünkü davranış aynen.
+KKALAN=0; KKAZ=0; KKGUNLUK=0; DSV=0; KKGOZ=0; GSINIR=0; GSV=0; SHEDEF=bootloader; KKWIFI=0; WBEKCI=1; KKZRAM=1
+for a in $(cat /proc/cmdline); do
+	case $a in
+	kk_alan=1) KKALAN=1;;
+	kk_alan_az=1) KKAZ=1;;	# G53 (öneri): yazma azaltma; yalnız kk_alan=1 ile birlikte etkili
+	kk_alan=ro) KKALAN=ro;;
+	kk_oturum=*) v=${a#kk_oturum=}; case $v in ''|*[!0-9]*) ;; *) [ "$v" -ge 30 ] && [ "$v" -lt $OTURUM ] && OTURUM=$v;; esac;;
+	kk_wd_sinir=*) v=${a#kk_wd_sinir=}; case $v in ''|*[!0-9]*) ;; *) [ "$v" -ge 60 ] && [ "$v" -lt $WD_SINIR ] && WD_SINIR=$v;; esac;;
+	kk_debian_sinir=*) v=${a#kk_debian_sinir=}; case $v in ''|*[!0-9]*) ;; *) [ "$v" -ge 120 ] && [ "$v" -lt $DEB_SINIR ] && DEB_SINIR=$v && DSV=1;; esac;;
+	kk_saglik_gozlem=1) KKGOZ=1;;	# G58 G-1K (öneri): yalnız AÇAR; init yalnız sınır kararında kullanır (bekçi kendisi okur)
+	kk_wifi.ac=1) KKWIFI=1;;	# G59-C (öneri): Wi-Fi zinciri yalnız AÇAR (çekirdek parametresi ile aynı anahtar; yoksa init Wi-Fi'ye hiç dokunmaz)
+	kk_zram=0) KKZRAM=0;;	# G59-L: zram takasi varsayilan ACIK; bu anahtar yalniz KAPATIR
+	kk_wifi_bekci=0) WBEKCI=0;;	# G59-C: kalıcı bekçi kapatma (yalnız KAPATIR)
+	kk_debian=0) DEBIAN=0;;
+	kk_gunluk=1) KKGUNLUK=1;;	# G57 G-1 (öneri): yalnız AÇAR; başka değer = yok
+	kk_gunluk_sinir=*) v=${a#kk_gunluk_sinir=}; case $v in ''|*[!0-9]*|0*|???????*) ;; *) [ "$v" -ge 3600 ] && [ "$v" -le 604800 ] && GSINIR=$v;; esac;;	# G59-A (öneri): 3600..604800 sn (7 gün; <= 6 hane, baştaki 0 yok); geçersiz = yok
+	esac
+done
+# G58: oturum sınırı zamanlayıcısı kurulur mu: kk_gunluk yokken her zaman (G57 ile aynı); kk_gunluk=1 iken yalnız açık
+#   kk_debian_sinir (G-1K) ya da gözlem (güvenli düşüş) varsa
+SINIRK=1; [ $KKGUNLUK = 1 ] && [ $DSV = 0 ] && [ $KKGOZ = 0 ] && SINIRK=0
+# G58-D: günlük üst süre. Yalnız kk_gunluk=1 + geçerli kk_gunluk_sinir + kk_debian_sinir YOK (G-1K yolu aynen). Aynı zamanlayıcı yolu: DEB_SINIR=GSINIR.
+# G59-A: günlük kipte (GSV=1) sınır eylemi normal reboot (SHEDEF=normal); aksi hâlde bootloader (G58-D'ye kadar her yol).
+[ $KKGUNLUK = 1 ] && [ $DSV = 0 ] && [ $GSINIR -gt 0 ] && { SINIRK=1; DEB_SINIR=$GSINIR; GSV=1; SHEDEF=normal; }
+echo $OTURUM > /kk-oturum
+hostname kk-anahat
+ifconfig lo 127.0.0.1 up
+
+say "==== Kara Kutu ana hat (G33: Debian salt okunur overlay; USB NCM; eMMC salt okuma) ===="
+say "kernel: $(cut -d' ' -f1-3 /proc/version)"
+say "model: $(cat /proc/device-tree/model 2>/dev/null)"
+say "cmdline: $(cat /proc/cmdline)"
+say "cpu: $(grep -c ^processor /proc/cpuinfo) cekirdek, online=$(cat /sys/devices/system/cpu/online)"
+say "bellek: $(grep -E 'MemTotal' /proc/meminfo | tr -s ' ') / $(grep -E 'MemAvailable' /proc/meminfo | tr -s ' ')"
+for W in /sys/class/watchdog/watchdog*; do [ -d $W ] && say "watchdog: $(basename $W) $(rd $W/identity) durum=$(rd $W/state) sure=$(rd $W/timeout)s nowayout=$(rd $W/nowayout)"; done
+if [ $KKGUNLUK = 1 ]; then KSG=$([ -x /bin/kk-saglik ] && sha256sum /bin/kk-saglik | cut -c1-16 || echo YOK)
+	if [ $GSV = 1 ]; then DOT="GUNLUK + gunluk siniri ${DEB_SINIR}s -> reboot normal (saglik bekcisi kk-saglik $KSG $([ $KKGOZ = 1 ] && echo GOZLEM || echo EYLEMLI))"
+	elif [ $SINIRK = 1 ]; then DOT="GUNLUK + oturum siniri ${DEB_SINIR}s (G-1K; saglik bekcisi kk-saglik $KSG $([ $KKGOZ = 1 ] && echo GOZLEM || echo EYLEMLI))"
+	else DOT="GUNLUK (oturum siniri YOK; saglik bekcisi kk-saglik $KSG)"; fi
+else DOT="${DEB_SINIR}s"; fi
+say "watchdog open_timeout=$(rd /sys/module/watchdog/parameters/open_timeout)s; init besleyecek, sert sinir ${WD_SINIR}s; initramfs oturumu ${OTURUM}s; debian oturumu $DOT; debian=$DEBIAN"
+say "alan (G52 E6 + G53): kk_alan=$KKALAN kk_alan_az=$KKAZ ($([ -x /bin/kk-alan ] && echo "kk-alan $(sha256sum /bin/kk-alan | cut -c1-16)" || echo 'kk-alan yok'))"
+say "devmem: $([ -e /dev/mem ] && echo VAR || echo yok)"
+RM=$(ls /sys/bus/platform/drivers/syscon-reboot-mode 2>/dev/null | grep -v -e bind -e uevent | tr '\n' ' ')
+say "reboot-mode: ${RM:-YOK}"
+mount -t pstore pstore /sys/fs/pstore 2>/dev/null
+say "pstore: $(ls /sys/fs/pstore 2>/dev/null | tr '\n' ' ')"
+# G47 (KV3/KV6): önceki açılışın değerlendirmesi. YALNIZ okuma + log (açma YOK; açma Debian'da 120 sn sonra).
+# pstore dosyaları silinmez. Bekçi hatası init'i etkilemez.
+[ -x /bin/kk-idle-bekci ] && /bin/kk-idle-bekci karar initramfs > /dev/null 2>&1
+
+# Yalnız QEMU sınama imajında var (cihaz imajında bu dosya YOK): watchdog açılmadan önceki takılma benzetimi.
+[ -x /bin/kk-qemu-ek ] && /bin/kk-qemu-ek erken
+
+# --- watchdog besleyici (arka plan); fd kapanmaz, NOWAYOUT. Çocuk "sleep"ler fd 3'ü taşımaz (devir için). ---
+(
+	# Aygıt yoksa "exec 3>" devtmpfs'te sıradan dosya yaratır; önce karakter aygıtı mı diye bak.
+	[ -c /dev/watchdog ] || { say "HATA: /dev/watchdog karakter aygiti yok; besleme yok"; exit 1; }
+	exec 3>/dev/watchdog || { say "HATA: /dev/watchdog acilamadi; open_timeout (180 sn) yolu gecerli"; exit 1; }
+	say "watchdog: init besliyor (15 sn), sert sinir uptime ${WD_SINIR}s"
+	while [ "$(upi)" -lt $WD_SINIR ]; do printf . >&3; sleep 15 3>&-; done
+	say "watchdog: SERT SINIR doldu (${WD_SINIR}s); besleme birakildi, reset bekleniyor"
+	while :; do sleep 3600 3>&-; done
+) &
+WDPID=$!
+
+# --- USB NCM gadget + telnetd ---
+usb_kur() {
+	mount -t configfs configfs /sys/kernel/config 2>/dev/null
+	[ -d /sys/kernel/config/usb_gadget ] || { say "HATA: configfs usb_gadget yok"; return 1; }
+	i=0; while [ -z "$(ls /sys/class/udc 2>/dev/null)" ] && [ $i -lt 20 ]; do sleep 0.5; i=$((i + 1)); done
+	UDC=$(ls /sys/class/udc 2>/dev/null | head -1)
+	[ -n "$UDC" ] || { say "HATA: UDC yok (10 sn)"; return 1; }
+	say "usb: UDC $UDC (${i} x 0.5 sn beklendi)"
+	G=/sys/kernel/config/usb_gadget/kk
+	mkdir $G || return 1
+	echo 0x1d6b > $G/idVendor
+	echo 0x0104 > $G/idProduct
+	echo 0x0633 > $G/bcdDevice
+	mkdir -p $G/strings/0x409 $G/configs/c.1/strings/0x409
+	echo "KK-ANAHAT" > $G/strings/0x409/serialnumber
+	echo "Kara Kutu" > $G/strings/0x409/manufacturer
+	echo "kk-anahat G33" > $G/strings/0x409/product
+	echo "kk-net" > $G/configs/c.1/strings/0x409/configuration
+	echo 250 > $G/configs/c.1/MaxPower
+	mkdir $G/functions/ncm.usb0 || { say "HATA: ncm.usb0 olusturulamadi"; return 1; }
+	echo $MAC_DEV > $G/functions/ncm.usb0/dev_addr
+	echo $MAC_HOST > $G/functions/ncm.usb0/host_addr
+	ln -s $G/functions/ncm.usb0 $G/configs/c.1/ || { say "HATA: ncm config'e baglanamadi"; return 1; }
+	echo $UDC > $G/UDC || { say "HATA: gadget UDC'ye baglanamadi"; return 1; }
+	IFN=$(rd $G/functions/ncm.usb0/ifname)
+	[ -n "$IFN" ] && [ -e /sys/class/net/$IFN ] || { say "HATA: ncm arayuzu yok (ifname='$IFN')"; return 1; }
+	ifconfig $IFN $IP_DEV netmask 255.255.255.0 up || { say "HATA: $IFN IP alamadi"; return 1; }
+	mkdir -p /dev/pts && mount -t devpts devpts /dev/pts
+	telnetd -b $IP_DEV:$PORT -l /bin/kk-karsila || { say "HATA: telnetd baslamadi"; return 1; }
+	say "usb ag: $IFN $IP_DEV/24 mac=$(rd /sys/class/net/$IFN/address) host_addr=$(rd $G/functions/ncm.usb0/host_addr); telnetd $IP_DEV:$PORT; UDC state $(rd /sys/class/udc/$UDC/state)"
+	return 0
+}
+usb_kur || say "UYARI: USB agi kurulamadi"
+
+# --- eMMC (G31 ile aynı) ---
+dev() { for u in /sys/class/block/mmcblk0p*/uevent; do grep -qx "PARTNAME=$1" $u && sed -n 's/^DEVNAME=//p' $u; done; }
+# bul <ad>: önce "<ad>", yoksa "<ad>_a". Tam bir eşleşme şart (birden çoksa kullanılmaz). Sonuç BD (aygıt), BA (bulunan ad).
+bul() {
+	BD=; BA=
+	for a in "$1" "$1_a"; do
+		d=$(dev "$a"); c=$(echo "$d" | grep -c .)
+		[ "$c" -gt 1 ] && { say "UYARI: '$a' adinda $c bolum; kullanilmadi"; return 1; }
+		[ "$c" -eq 1 ] && { BD=$d; BA=$a; return 0; }
+	done
+	return 1
+}
+i=0; while [ ! -e /sys/block/mmcblk0 ] && [ $i -lt 30 ]; do sleep 0.5; i=$((i + 1)); done
+if [ ! -e /sys/block/mmcblk0 ]; then
+	say "HATA: mmcblk0 yok (15 sn)"
+	DEBIAN=0
+else
+	C=$(ls -d /sys/class/mmc_host/mmc*/mmc*:* 2>/dev/null | head -1)
+	say "mmc kart: $(basename "$C") ad=$(rd $C/name) tur=$(rd $C/type) uretici=$(rd $C/manfid) tarih=$(rd $C/date) rev=$(rd $C/rev)"
+	say "mmcblk0: $(cat /sys/block/mmcblk0/size) sektor, ro=$(cat /sys/block/mmcblk0/ro), blockdev --getro=$(blockdev --getro /dev/mmcblk0 2>&1)"
+	# ios yalnız host->ios'u yazdırır, karta komut göndermez. debugfs yalnız bunun için bağlanır ve hemen ayrılır.
+	: > /kk-ios.txt
+	mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+	k=0
+	for f in /sys/kernel/debug/mmc*/ios; do
+		[ -r "$f" ] || continue
+		h=${f%/ios}; h=${h##*/}; k=$((k + 1))
+		while read -r l; do say "ios $h: $l"; echo "$h: $l" >> /kk-ios.txt; done < "$f"
+	done
+	umount /sys/kernel/debug 2>/dev/null
+	say "debugfs ayrildi: $(grep -c ' /sys/kernel/debug ' /proc/mounts) bagli"
+	[ $k -gt 0 ] || say "ios: okunamadi (debugfs/mmc ios yok)"
+	n=0
+	for d in /sys/class/block/mmcblk0p*; do
+		[ -e "$d/partition" ] || continue
+		n=$((n + 1))
+		say "bolum $(basename $d) $(sed -n 's/^PARTNAME=//p' $d/uevent) start=$(cat $d/start) size=$(cat $d/size)"
+	done
+	say "bolum sayisi: $n"
+	if bul vendor; then
+		V=$BD
+		N=$(( $(cat /sys/class/block/$V/size) / 2048 )); [ $N -gt 256 ] && N=256
+		t1=$(up); dd if=/dev/$V of=/dev/null bs=1M count=$N iflag=direct 2>/dev/null; t2=$(up)
+		say "hiz: vendor (ad=$BA) /dev/$V $N MiB O_DIRECT okuma $(awk -v a=$t1 -v b=$t2 -v n=$N 'BEGIN{d=b-a; printf "%.2f sn = %.1f MB/s", d, n*1.048576/d}')"
+	else
+		say "hiz: vendor bolumu yok (ne vendor ne vendor_a); hiz testi yapilmadi"
+	fi
+	for p in kernel erecovery_kernel nvme misc vendor; do
+		bul $p || { say "sha $p: bolum yok (ne $p ne ${p}_a)"; continue; }
+		D=$BD
+		t1=$(up); s=$(sha256sum /dev/$D | cut -c1-64); t2=$(up)
+		say "sha $p (ad=$BA) /dev/$D $(( $(cat /sys/class/block/$D/size) * 512 )) B $s ($(awk -v a=$t1 -v b=$t2 'BEGIN{printf "%.1f", b-a}') sn)"
+	done
+fi
+# --- G34: HS200 geri düşüş gösterimi (yalnız cmdline kk_hs200_dusus_testi; hiçbir bölüm bağlı değilken) ---
+ios_oku() {	# ios_oku <etiket>: debugfs yalnız ios için bağlanır, ayrılır
+	mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null
+	for f in /sys/kernel/debug/mmc*/ios; do
+		[ -r "$f" ] || continue
+		say "ios[$1] ${f#/sys/kernel/debug/}: $(grep -E 'actual clock|bus width|timing spec|signal voltage' $f | tr -s '\t ' ' ' | tr '\n' '|')"
+	done
+	umount /sys/kernel/debug 2>/dev/null
+}
+mmc_bekle() {	# mmc_bekle <var|yok> : en çok 30 sn
+	i=0
+	while [ $i -lt 60 ]; do
+		if [ "$1" = var ]; then [ -e /sys/block/mmcblk0 ] && return 0; else [ -e /sys/block/mmcblk0 ] || return 0; fi
+		sleep 0.5; i=$((i + 1))
+	done
+	return 1
+}
+hs200_dusus_testi() {
+	grep -qw kk_hs200_dusus_testi /proc/cmdline || return 0
+	[ -e /sys/block/mmcblk0 ] || { say "hs200 dusus testi: mmcblk0 yok; atlandi"; return 1; }
+	# /sys/block/mmcblk0/device = kartın kendisi (mmcblk sürücüsü bağlı); denetleyici onun üstünde (mmc_host/mmcN'in ebeveyni)
+	X=$(readlink -f /sys/block/mmcblk0/device); X=${X%/*}
+	while [ "$X" != / ] && [ ! -e "$X/driver" ]; do X=${X%/*}; done
+	[ -e "$X/driver" ] || { say "hs200 dusus testi: denetleyici bulunamadi"; return 1; }
+	D=${X##*/}; DRV=$(readlink -f $X/driver); P=/sys/module/sdhci_of_dwcmshc/parameters/kk_tuning_hata
+	for adim in dusus geri; do
+		v=1; [ $adim = geri ] && v=0
+		[ -w $P ] && echo $v > $P
+		say "hs200 dusus testi [$adim]: $D (${DRV##*/}) unbind/bind; kk_tuning_hata=$(cat $P 2>/dev/null || echo yok)"
+		echo $D > $DRV/unbind; mmc_bekle yok || say "UYARI: mmcblk0 unbind sonrasi kaybolmadi"
+		echo $D > $DRV/bind; mmc_bekle var || { say "HATA: hs200 dusus testi [$adim]: mmcblk0 30 sn'de gelmedi"; return 1; }
+		ios_oku "$adim"
+		bul misc && say "hs200 dusus testi [$adim]: sha misc (ad=$BA) $(sha256sum /dev/$BD | cut -c1-64)"
+	done
+	say "hs200 dusus testi bitti; $(dmesg | grep -c 'kk: HS200 .* basarisiz') geri dusus satiri"
+}
+[ -e /sys/block/mmcblk0 ] && hs200_dusus_testi
+
+B=$(dmesg | grep -c 'kk: mmc write blocked: ')
+say "mmc write blocked sayisi: $B"
+dmesg | grep -v '\] kk: ' | grep -E 'mmc|sdhci|dwcmshc|kk: mmc' | while read -r l; do say "dmesg: $l"; done
+[ -x /bin/kk-qemu-ek ] && /bin/kk-qemu-ek son
+say "eMMC salt okuma bitti (up=$(up)s)"
+
+# --- Debian: salt okunur overlay hazırlığı (geri dönülebilir) ---
+Y=/kk/yeni
+ust_yaz() {
+	E=$Y/etc
+	mkdir -p $E/systemd/system/timers.target.wants $E/systemd/system/multi-user.target.wants \
+		$E/systemd/system.conf.d $E/systemd/journald.conf.d $E/ssh/sshd_config.d $E/tmpfiles.d $E/sysctl.d || return 1
+	for u in kk-wifi.service kk-charge.service kk-clock.service kk-clock-save.service kk-clock-save.timer \
+		kk-ekran.service kk-bootok.service systemd-timesyncd.service \
+		systemd-pstore.service apt-daily.timer apt-daily-upgrade.timer man-db.timer dpkg-db-backup.timer \
+		e2scrub_all.timer e2scrub_reap.service fstrim.timer wpa_supplicant@wlan0.service wpa_supplicant.service; do
+		rm -f $E/systemd/system/$u; ln -s /dev/null $E/systemd/system/$u || return 1
+	done
+	printf '%s\n' "# Kara Kutu G33 ana hat: YALNIZ 2222 (4.9 Debian 22'de; karismasin)" "Port 2222" > $E/ssh/sshd_config.d/zz-kk-anahat.conf
+	# G34 (bakımcı onayı, entropi (a)): CRNG ~126 sn'de hazır; sshd -t getrandom'da bekler -> başlatma süresi 300 sn
+	mkdir -p $E/systemd/system/ssh.service.d || return 1
+	printf '%s\n' "# Kara Kutu G34 ana hat: CRNG gec hazir (entropi kaynagi yok); ilk baslatma zaman asimina ugramasin" \
+		"[Service]" "TimeoutStartSec=300" > $E/systemd/system/ssh.service.d/zz-kk-anahat.conf
+	# G37-B: internet ana makine NAT'ı üzerinden (yalnız ana hat; 4.9'un 10-kk-usb.network'ü alt katmanda değişmez)
+	mkdir -p $E/systemd/network/10-kk-usb.network.d || return 1
+	printf '%s\n' "# Kara Kutu G37 ana hat: varsayilan yol ana makine (IPMasquerade + ufw route, yalniz 172.16.42.0/24)" \
+		"[Network]" "Gateway=172.16.42.2" > $E/systemd/network/10-kk-usb.network.d/zz-kk-anahat.conf
+	echo kk-anahat-debian > $E/hostname
+	printf '127.0.1.1\tkk-anahat-debian\n' >> $E/hosts
+	printf '%s\n' "# Kara Kutu G33 ana hat: watchdog systemd'de (NOWAYOUT kernel'de)" "[Manager]" "RuntimeWatchdogSec=60s" \
+		"RebootWatchdogSec=2min" "WatchdogDevice=/dev/watchdog" "DefaultTimeoutStopSec=20s" "ShowStatus=yes" > $E/systemd/system.conf.d/zz-kk-anahat.conf
+	printf '%s\n' "# Kara Kutu G33 ana hat: kalici yazma yok, kmsg'ye (pstore) de" "[Journal]" "Storage=volatile" \
+		"RuntimeMaxUse=32M" "ForwardToKMsg=yes" "MaxLevelKMsg=info" > $E/systemd/journald.conf.d/zz-kk-anahat.conf
+	printf '%s\n' "# Kara Kutu G33 ana hat: her reboot bootloader'a" "f+ /run/systemd/reboot-param 0644 root root - bootloader" > $E/tmpfiles.d/kk-anahat.conf
+	printf '%s\n' "# Kara Kutu G33 ana hat: sysrq kapali (normal reboot cihazi yeniden ana hatta acar)" "kernel.sysrq = 0" > $E/sysctl.d/99-kk-anahat.conf
+	[ $SINIRK = 0 ] || printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat oturum siniri (${DEB_SINIR} sn)" "[Timer]" "OnBootSec=${DEB_SINIR}s" "AccuracySec=1s" \
+		"[Install]" "WantedBy=timers.target" > $E/systemd/system/kk-anahat-sinir.timer
+	mkdir -p $Y/usr/local/sbin || return 1
+	if [ $GSV = 1 ]; then
+	cat > $Y/usr/local/sbin/kk-anahat-sinir <<EOF
+#!/bin/sh
+# Kara Kutu G59-A (init yazar, yalniz ust katman): gunluk siniri -> reboot normal (DT mode-normal 0x10; ana hat yeniden acilir)
+echo "<4>kk: anahat debian gunluk siniri (${DEB_SINIR}s): reboot normal" > /dev/kmsg
+exec /bin/systemctl reboot normal
+EOF
+	else
+	cat > $Y/usr/local/sbin/kk-anahat-sinir <<EOF
+#!/bin/sh
+# Kara Kutu G33 (init yazar, yalniz ust katman): oturum siniri -> reboot bootloader
+echo "<4>kk: anahat debian oturum siniri (${DEB_SINIR}s): reboot bootloader" > /dev/kmsg
+exec /bin/systemctl reboot bootloader
+EOF
+	fi
+	cat > $Y/usr/local/sbin/kk-anahat-isaret <<'EOF'
+#!/bin/sh
+# Kara Kutu G33 (init yazar, yalniz ust katman): durum isareti -> kmsg (pstore). Yalniz okuma.
+k=/dev/kmsg
+sleep 10
+echo "<4>kk: anahat debian: $(uname -r) $(hostname) durum=$(systemctl is-system-running)" > $k
+systemctl --failed --plain --no-legend --no-pager | while read -r l; do echo "<4>kk: anahat debian failed: $l" > $k; done
+echo "<4>kk: anahat debian dinleyen: $(ss -Hltn | awk '{print $4}' | tr '\n' ' ')" > $k
+ip -br addr | while read -r l; do echo "<4>kk: anahat debian ip: $l" > $k; done
+echo "<4>kk: anahat debian yol: $(ip -4 route show default | head -1); chrony=$(systemctl is-active chrony)" > $k
+echo "<4>kk: anahat debian networkctl: $(networkctl list --no-legend --no-pager 2>/dev/null | awk '{print $2"="$4"/"$5}' | tr '\n' ' ')" > $k
+echo "<4>kk: anahat debian reboot-param=$(cat /run/systemd/reboot-param 2>/dev/null) sysrq=$(cat /proc/sys/kernel/sysrq) watchdog=$(systemctl show -p RuntimeWatchdogUSec --value) kok=$(findmnt -no SOURCE,FSTYPE,OPTIONS /) data=$(findmnt -no OPTIONS /data)" > $k
+m=$(for f in /etc/systemd/system/* /usr/lib/systemd/system/*; do [ "$(readlink "$f")" = /dev/null ] && echo "${f##*/}"; done | sort -u | tr '\n' ' ')
+echo "<4>kk: anahat debian maskeli ($(echo $m | wc -w)): $(echo $m | cut -c1-900)" > $k
+EOF
+	cat > $Y/usr/local/sbin/kk-anahat-ip-yedek <<'EOF'
+#!/bin/sh
+# Kara Kutu G33-B2 (init yazar, yalniz ust katman): USB gadget arayuzunde (MAC 02:4b:4b:00:00:01) 172.16.42.1/24
+# yoksa ekler. networkd basariliysa hicbir sey yapmaz. Yalniz durum degisince kmsg'ye yazar.
+k=/dev/kmsg; D=/run/kk-ip-yedek.durum
+IF=; for n in /sys/class/net/*; do [ "$(cat $n/address 2>/dev/null)" = 02:4b:4b:00:00:01 ] && IF=${n##*/}; done
+[ -n "$IF" ] || { [ "$(cat $D 2>/dev/null)" = arayuz-yok ] || echo "<4>kk: ip-yedek: gadget arayuzu (02:4b:4b:00:00:01) yok" > $k; echo arayuz-yok > $D; exit 0; }
+if ip -4 -o addr show dev "$IF" | grep -q ' 172\.16\.42\.1/24 '; then
+	s="var:$IF"
+	[ "$(cat $D 2>/dev/null)" = "$s" ] || echo "<4>kk: ip-yedek: $IF 172.16.42.1/24 VAR (kaynak: $( [ -e /run/kk-ip-yedek.ekledi ] && echo yedek || echo networkd )); islem yok; networkctl: $(networkctl list --no-legend --no-pager 2>/dev/null | awk -v i="$IF" '$2==i{print $4"/"$5}')" > $k
+	echo "$s" > $D; exit 0
+fi
+ip link set "$IF" up
+if ip addr add 172.16.42.1/24 dev "$IF" 2>/tmp/kk-ip-yedek.err; then
+	touch /run/kk-ip-yedek.ekledi
+	echo "<4>kk: ip-yedek: $IF'te 172.16.42.1/24 YOKTU -> YEDEK EKLEDI; networkctl: $(networkctl list --no-legend --no-pager 2>/dev/null | awk -v i="$IF" '$2==i{print $4"/"$5}')" > $k
+else
+	echo "<3>kk: ip-yedek: $IF'e adres eklenemedi: $(cat /tmp/kk-ip-yedek.err)" > $k
+fi
+echo "eklendi:$IF" > $D
+EOF
+	chmod 755 $Y/usr/local/sbin/kk-anahat-sinir $Y/usr/local/sbin/kk-anahat-isaret $Y/usr/local/sbin/kk-anahat-ip-yedek || return 1
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: usb0 IP yedegi (172.16.42.1/24)" "[Service]" "Type=oneshot" \
+		"ExecStart=/usr/local/sbin/kk-anahat-ip-yedek" > $E/systemd/system/kk-anahat-ip-yedek.service
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: usb0 IP yedegi (60 sn sonra, 30 sn'de bir)" "[Timer]" "OnStartupSec=60s" \
+		"OnUnitActiveSec=30s" "AccuracySec=1s" "[Install]" "WantedBy=timers.target" > $E/systemd/system/kk-anahat-ip-yedek.timer
+	ln -s ../kk-anahat-ip-yedek.timer $E/systemd/system/timers.target.wants/kk-anahat-ip-yedek.timer || return 1
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat oturum siniri: reboot ${SHEDEF}" "[Service]" "Type=oneshot" \
+		"ExecStart=/usr/local/sbin/kk-anahat-sinir" > $E/systemd/system/kk-anahat-sinir.service
+	if [ $SINIRK = 1 ]; then ln -s ../kk-anahat-sinir.timer $E/systemd/system/timers.target.wants/kk-anahat-sinir.timer || return 1; fi
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: durum isareti (kmsg/pstore)" "After=multi-user.target ssh.service" \
+		"[Service]" "Type=oneshot" "ExecStart=/usr/local/sbin/kk-anahat-isaret" \
+		"[Install]" "WantedBy=multi-user.target" > $E/systemd/system/kk-anahat-isaret.service
+	ln -s ../kk-anahat-isaret.service $E/systemd/system/multi-user.target.wants/kk-anahat-isaret.service || return 1
+	# G47 (KV3): cpuidle bekçisi. Tek kaynak: initramfs'teki /bin/kk-idle-bekci aynen kopyalanır. 120 sn sonra
+	# önceki açılışın kaydına göre A1-A3 aşamalı açma (yazma yalnız cpuidle stateN/disable); 10 dk'da bir durum satırı.
+	cp /bin/kk-idle-bekci $Y/usr/local/sbin/kk-idle-bekci && chmod 755 $Y/usr/local/sbin/kk-idle-bekci || return 1
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: cpuidle bekcisi (onceki acilisa gore asamali acma)" \
+		"After=kk-anahat-isaret.service ssh.service" "[Service]" "Type=oneshot" "ExecStart=/usr/local/sbin/kk-idle-bekci uygula" \
+		"StandardOutput=null" "TimeoutStartSec=600" > $E/systemd/system/kk-idle-bekci.service
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: cpuidle bekcisi (acilistan 120 sn sonra)" "[Timer]" "OnBootSec=120s" \
+		"AccuracySec=1s" "[Install]" "WantedBy=timers.target" > $E/systemd/system/kk-idle-bekci.timer
+	ln -s ../kk-idle-bekci.timer $E/systemd/system/timers.target.wants/kk-idle-bekci.timer || return 1
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: cpuidle durum isareti (kmsg/pmsg)" "[Service]" "Type=oneshot" \
+		"ExecStart=/usr/local/sbin/kk-idle-bekci durum" "StandardOutput=null" > $E/systemd/system/kk-idle-durum.service
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: cpuidle durum isareti (10 dk'da bir)" "[Timer]" "OnBootSec=10min" \
+		"OnUnitActiveSec=10min" "AccuracySec=1s" "[Install]" "WantedBy=timers.target" > $E/systemd/system/kk-idle-durum.timer
+	ln -s ../kk-idle-durum.timer $E/systemd/system/timers.target.wants/kk-idle-durum.timer || return 1
+	alan_yaz || return 1
+	saglik_yaz || return 1
+	wifi_yaz || return 1
+	zram_yaz || return 1
+	return 0
+}
+# G57 G-1 (öneri): günlük kip sağlık bekçisi. Yalnız kk_gunluk=1; yalnız üst katman (tmpfs). Tek kaynak: initramfs'teki
+# /bin/kk-saglik aynen kopyalanır. Oturum sınırı zamanlayıcısı yukarıda kurulmadı (kk-anahat-sinir.service elle başlatılabilir:
+# reboot bootloader). Bekçi yalnız okur; eylemi systemctl reboot bootloader (başarısızsa kk-alan kapat + kk-reboot2).
+saglik_yaz() {
+	[ $KKGUNLUK = 1 ] || return 0
+	[ -x /bin/kk-saglik ] || { say "HATA: kk_gunluk=1 ama /bin/kk-saglik yok; oturum siniri zamanlayicisi geri kuruluyor"
+		[ $SINIRK = 1 ] && return 0	# G58 G-1K: zamanlayıcı zaten kurulu
+		printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat oturum siniri (${DEB_SINIR} sn; gunluk bekci yok)" "[Timer]" "OnBootSec=${DEB_SINIR}s" \
+			"AccuracySec=1s" "[Install]" "WantedBy=timers.target" > $E/systemd/system/kk-anahat-sinir.timer
+		ln -s ../kk-anahat-sinir.timer $E/systemd/system/timers.target.wants/kk-anahat-sinir.timer; return 0; }
+	S=$E/systemd/system
+	cp /bin/kk-saglik $Y/usr/local/sbin/kk-saglik && chmod 755 $Y/usr/local/sbin/kk-saglik || return 1
+	[ -x $Y/usr/local/sbin/kk-reboot2 ] || { cp /bin/kk-reboot2 $Y/usr/local/sbin/kk-reboot2 && chmod 755 $Y/usr/local/sbin/kk-reboot2 || return 1; }
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: gunluk kip saglik bekcisi (G57 G-1)" "After=kk-alan.service" \
+		"[Service]" "Type=oneshot" "TimeoutStartSec=50" "StandardOutput=null" "ExecStart=/usr/local/sbin/kk-saglik yokla" > $S/kk-saglik.service
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: gunluk kip saglik bekcisi (30 sn sonra, 60 sn'de bir)" "[Timer]" "OnBootSec=30s" \
+		"OnUnitActiveSec=60s" "AccuracySec=5s" "[Install]" "WantedBy=timers.target" > $S/kk-saglik.timer
+	ln -s ../kk-saglik.timer $S/timers.target.wants/kk-saglik.timer || return 1
+	if [ "$KKALAN" = 1 ] && [ "$KKAZ" = 1 ]; then	# yazma azaltma: kalp (info) saklanmaz; geçişler (warning) saklanır
+		mkdir -p $S/kk-saglik.service.d && printf '%s\n' "# Kara Kutu G57 G-1 yazma azaltma: kalp satiri (info) saklanmaz" \
+			"[Service]" "LogLevelMax=notice" > $S/kk-saglik.service.d/zz-kk-alan-az.conf || return 1
+	fi
+	return 0
+}
+# G59-C (öneri): Wi-Fi zinciri birimleri. Yalnız kk_wifi.ac=1; yalnız üst katman (tmpfs; rootfs eMMC'ye yazılmaz). Tek kaynak: initramfs'teki
+# /bin/kk-wifi-yukle ve /bin/kk-wifi-bekci2 aynen kopyalanır. PSK/SSID/BSSID bu betikte YOK (ek.conf'u kk-wifi-yukle çalışma anında üretir).
+# Debian'ın wpa_supplicant@wlan0 / wpa_supplicant maskeleri (ust_yaz) KALIR; wpa'yı kendi kk-wpa.service'imiz başlatır.
+wifi_yaz() {
+	[ "$KKWIFI" = 1 ] || return 0
+	[ -x /bin/kk-wifi-yukle ] && [ -x /bin/kk-wifi-bekci2 ] || { say "UYARI: kk_wifi.ac=1 ama /bin/kk-wifi-yukle ya da kk-wifi-bekci2 yok; Wi-Fi birimleri yazilmadi"; return 0; }
+	S=$E/systemd/system
+	mkdir -p $S/multi-user.target.wants $S/timers.target.wants $S/systemd-networkd.service.d $E/systemd/network $Y/usr/local/sbin || return 1
+	cp /bin/kk-wifi-yukle $Y/usr/local/sbin/kk-wifi-yukle && chmod 755 $Y/usr/local/sbin/kk-wifi-yukle || return 1
+	cp /bin/kk-wifi-bekci2 $Y/usr/local/sbin/kk-wifi-bekci2 && chmod 755 $Y/usr/local/sbin/kk-wifi-bekci2 || return 1
+	# bekçi yedek reboot yolu (kk-reboot2 yalnız bootloader kabul eder): busybox reboot -f (sync + komutsuz RESTART -> normal 0x10)
+	[ -x $Y/usr/local/sbin/busybox-kk ] || { cp /bin/busybox $Y/usr/local/sbin/busybox-kk && chmod 755 $Y/usr/local/sbin/busybox-kk || return 1; }
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: Wi-Fi tetik zinciri (F1 kapi, Y1 yukleyici, M3b HAZIR, wpa; G59-C)" \
+		"After=ssh.service systemd-networkd.service" "[Service]" "Type=simple" "TimeoutStopSec=10" "StandardOutput=null" \
+		"ExecStart=/usr/local/sbin/kk-wifi-yukle" > $S/kk-wifi-yukle.service
+	ln -s ../kk-wifi-yukle.service $S/multi-user.target.wants/kk-wifi-yukle.service || return 1
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: wpa_supplicant wlan0 (4.9 dosyasi -c, PSK'siz ek ayar -I; G59-C)" \
+		"StartLimitIntervalSec=600" "StartLimitBurst=5" "[Service]" "Type=simple" \
+		"ExecStart=/sbin/wpa_supplicant -q -i wlan0 -D nl80211 -c /etc/wpa_supplicant/wpa_supplicant-wlan0.conf -I /run/kk-wifi/ek.conf -P /run/kk-wifi/pid" \
+		"Restart=on-failure" "RestartSec=30" "LogLevelMax=notice" > $S/kk-wpa.service
+	printf '%s\n' "[Match]" "Name=wlan0" "" "[Link]" "RequiredForOnline=no" "" "[Network]" "DHCP=ipv4" "LinkLocalAddressing=no" \
+		"IPv6AcceptRA=no" "LLMNR=no" "MulticastDNS=no" "" "[DHCPv4]" "ClientIdentifier=mac" "SendHostname=no" "UseHostname=no" \
+		"UseDomains=no" "UseSIP=no" "UseNTP=no" "UseTimezone=no" "UseMTU=no" "UseRoutes=yes" "UseGateway=yes" "UseDNS=no" \
+		"RouteMetric=100" > $E/systemd/network/19-kk-wifi.network
+	printf '%s\n' "# Kara Kutu G59-C: networkd INFO'da SSID/BSSID basar -> journald -> kmsg sizintisi; notice'e kisilir (networkd baslamadan yazildi)" \
+		"[Service]" "Environment=SYSTEMD_LOG_LEVEL=notice" "LogLevelMax=notice" > $S/systemd-networkd.service.d/kk-gunluk.conf
+	if [ "$KKGUNLUK" = 1 ] && [ -x /bin/kk-saglik ]; then	# Wi-Fi birimi failed -> saglik 'degraded' -> bootloader eylemi OLMASIN
+		mkdir -p $S/kk-saglik.service.d && printf '%s\n' "# Kara Kutu G59-C: Wi-Fi birimleri saglik nedeni DEGIL (ayri koruma: kk-wifi-bekci2)" \
+			"[Service]" "Environment=KK_SAGLIK_YOKSAY=kk-alan.service,kk-idle-bekci.service,kk-wifi-yukle.service,kk-wpa.service,kk-wifi-bekci2.service,kk-zram.service" \
+			> $S/kk-saglik.service.d/zz-kk-wifi.conf || return 1
+	fi
+	if [ "$WBEKCI" = 1 ]; then
+		printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: Wi-Fi kopma bekcisi (20 dk kesintisiz -> reboot normal; G59-C)" "[Service]" "Type=oneshot" \
+			"TimeoutStartSec=180" "StandardOutput=null" "ExecStart=/usr/local/sbin/kk-wifi-bekci2" > $S/kk-wifi-bekci2.service
+		printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: Wi-Fi kopma bekcisi (5 dk sonra, 120 sn'de bir)" "[Timer]" "OnBootSec=5min" \
+			"OnUnitActiveSec=120s" "AccuracySec=10s" "[Install]" "WantedBy=timers.target" > $S/kk-wifi-bekci2.timer
+		ln -s ../kk-wifi-bekci2.timer $S/timers.target.wants/kk-wifi-bekci2.timer || return 1
+	fi
+	say "wifi: kk-wifi-yukle + kk-wpa + 19-kk-wifi.network + networkd(notice) + bekci=$WBEKCI yazildi"
+	return 0
+}
+# G59-L: zram takasi (zstd 2 GiB, sikistirilmis <= 1 GiB, oncelik 100; diske yazmaz). Birim oneshot, ExecStart '-' (failed olmaz);
+# kk_zram=0 ile hic yazilmaz. Betik initramfs'teki /bin/kk-zram'in aynen kopyasi (yalniz ust katman tmpfs).
+zram_yaz() {
+	[ "$KKZRAM" = 1 ] || { say "zram: kk_zram=0 -> birim yazilmadi"; return 0; }
+	[ -x /bin/kk-zram ] || { say "UYARI: /bin/kk-zram yok; zram birimi yazilmadi"; return 0; }
+	S=$E/systemd/system
+	mkdir -p $S/sysinit.target.wants $Y/usr/local/sbin || return 1
+	cp /bin/kk-zram $Y/usr/local/sbin/kk-zram && chmod 755 $Y/usr/local/sbin/kk-zram || return 1
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: zram takasi (zstd 2 GiB; diske yazmaz; G59-L)" "DefaultDependencies=no" \
+		"After=systemd-modules-load.service" "Before=sysinit.target swap.target" "[Service]" "Type=oneshot" "RemainAfterExit=yes" \
+		"StandardOutput=null" "TimeoutStartSec=60" "ExecStart=-/usr/local/sbin/kk-zram" > $S/kk-zram.service
+	ln -s ../kk-zram.service $S/sysinit.target.wants/kk-zram.service || return 1
+	say "zram: kk-zram.service yazildi (zstd 2 GiB, mem_limit 1 GiB, oncelik 100, swappiness 100)"
+	return 0
+}
+# G52 E6 (öneri): alan.img iç ext4'ünün açılışta bağlanması. Yalnız kk_alan=1|ro iken; yalnız üst katman (tmpfs).
+# Tek kaynak: initramfs'teki /bin/kk-alan aynen kopyalanır. Kalıcı olan yalnız /var/log/journal (bind) + iç fs'teki sayaç.
+# journald: kk_alan=1 iken Storage=persistent, ama /var'a geçiş (flush) YALNIZ /var/log/journal bağlama noktasıysa
+# (kk-alan başarılı); değilse journald /run'da kalır (bugünkü volatile ile aynı). Alt katmandaki 4.9 günlüğü bind altında gizli.
+alan_yaz() {
+	[ "$KKALAN" = 0 ] && return 0
+	[ -x /bin/kk-alan ] || { say "UYARI: kk_alan=$KKALAN ama /bin/kk-alan yok; alan birimleri yazilmadi"; return 0; }
+	S=$E/systemd/system
+	mkdir -p $S/sysinit.target.wants $S/systemd-journal-flush.service.d $Y/alan || return 1
+	cp /bin/kk-alan $Y/usr/local/sbin/kk-alan && chmod 755 $Y/usr/local/sbin/kk-alan || return 1
+	# G52 QEMU q-disari: alt katman bellekte bozulursa "systemctl reboot" birim dosyasını okuyamayıp reddedebilir ->
+	# oturum sınırına statik kk-reboot2 yedeği (yalnız E6 imajında; kk_alan yokken sınır betiği bugünküyle aynı)
+	cp /bin/kk-reboot2 $Y/usr/local/sbin/kk-reboot2 && chmod 755 $Y/usr/local/sbin/kk-reboot2 || return 1
+	if [ $GSV = 1 ]; then	# G59-A: günlük kip: normal reboot; yedek de normal (busybox reboot -f: sync + komutsuz RESTART -> 0x10)
+		cp /bin/busybox $Y/usr/local/sbin/busybox-kk && chmod 755 $Y/usr/local/sbin/busybox-kk || return 1
+	cat > $Y/usr/local/sbin/kk-anahat-sinir <<EOF
+#!/bin/sh
+# Kara Kutu G59-A (init yazar, yalniz ust katman): gunluk siniri -> reboot normal (DT mode-normal 0x10; ana hat yeniden acilir);
+# systemctl basarisizsa kk-alan kapat + busybox reboot -f (sync + komutsuz RESTART -> normal 0x10; kk-reboot2 yalniz bootloader kabul eder)
+echo "<4>kk: anahat debian gunluk siniri (${DEB_SINIR}s): reboot normal" > /dev/kmsg
+/bin/systemctl reboot normal && exit 0
+echo "<3>kk: gunluk siniri: systemctl reboot basarisiz; kk-alan kapat + busybox reboot -f (normal)" > /dev/kmsg
+/usr/local/sbin/kk-alan kapat sinir-yedek
+exec /usr/local/sbin/busybox-kk reboot -f
+EOF
+	else
+	cat > $Y/usr/local/sbin/kk-anahat-sinir <<EOF
+#!/bin/sh
+# Kara Kutu G33 + G52 E6 (init yazar, yalniz ust katman): oturum siniri -> reboot bootloader; systemctl basarisizsa
+# kk-alan kapat + kk-reboot2 (statik; sync + RESTART2 bootloader)
+echo "<4>kk: anahat debian oturum siniri (${DEB_SINIR}s): reboot bootloader" > /dev/kmsg
+/bin/systemctl reboot bootloader && exit 0
+echo "<3>kk: oturum siniri: systemctl reboot basarisiz; kk-alan kapat + kk-reboot2 bootloader" > /dev/kmsg
+/usr/local/sbin/kk-alan kapat sinir-yedek
+exec /usr/local/sbin/kk-reboot2 bootloader
+EOF
+	fi
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: alan.img (yalniz /var/log/journal kalici; G52 E6)" "DefaultDependencies=no" \
+		"After=systemd-journald.service alan.mount var-log-journal.mount" \
+		"Before=systemd-journal-flush.service sysinit.target shutdown.target" "Conflicts=shutdown.target" \
+		"[Service]" "Type=oneshot" "RemainAfterExit=yes" "TimeoutStartSec=180" "TimeoutStopSec=60" \
+		"ExecStart=/usr/local/sbin/kk-alan bagla" "ExecStop=/usr/local/sbin/kk-alan kapat temiz" > $S/kk-alan.service
+	ln -s ../kk-alan.service $S/sysinit.target.wants/kk-alan.service || return 1
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: alan izleme (butce, kapsam, discard, doluluk)" "After=kk-alan.service" \
+		"ConditionPathExists=/run/kk-alan/izle" "[Service]" "Type=oneshot" "TimeoutStartSec=60" \
+		"ExecStart=/usr/local/sbin/kk-alan izle" > $S/kk-alan-izle.service
+	printf '%s\n' "[Unit]" "Description=Kara Kutu ana hat: alan izleme (60 sn)" "[Timer]" "OnBootSec=90s" "OnUnitActiveSec=60s" \
+		"AccuracySec=5s" "[Install]" "WantedBy=timers.target" > $S/kk-alan-izle.timer
+	ln -s ../kk-alan-izle.timer $S/timers.target.wants/kk-alan-izle.timer || return 1
+	[ "$KKALAN" = 1 ] || return 0
+	printf '%s\n' "# Kara Kutu G52 E6: /var'a gecis yalniz alan bagliysa (kk-alan bind)" "[Unit]" "After=kk-alan.service" \
+		"ConditionPathIsMountPoint=/var/log/journal" > $S/systemd-journal-flush.service.d/zz-kk-alan.conf
+	# drop-in adı zz-kk-anahat.conf'tan SONRA sıralanmalı (Storage=volatile'ı ezer; G52 QEMU q-dene bulgusu)
+	printf '%s\n' "# Kara Kutu G52 E6: kalici gunluk alan.img'de (flush yalniz bind varsa; yoksa /run)" "[Journal]" "Storage=persistent" \
+		"SystemMaxUse=256M" "SystemKeepFree=256M" "SystemMaxFileSize=32M" "SyncIntervalSec=30s" > $E/systemd/journald.conf.d/zzz-kk-alan.conf
+	[ "$KKAZ" = 1 ] || return 0
+	# G53 (öneri): YAZMA AZALTMA (günlük kullanım; TASARIM-E6 §8.5). Yalnız kk_alan=1 kk_alan_az=1. Hepsi üst katmanda (tmpfs).
+	#  journald: küçük dosya (karma tablosu 932 -> 233 KiB), 5 dk senkron, debug saklanmaz (çekirdek KERN_DEBUG + "<7>" satırları
+	#  yalnız konsol/pstore'a); periyodik kirli sayfa geri yazımı kapalı (ana hatta blok aygıtına yazan tek fs alan); zamanlayıcı birimlerinin
+	#  bilgi satırları ve ssh yoklama seli süzülür. kk-alan bağlamayı commit=300,lazytime ile yapar (kk_alan_az=1'i kendisi okur).
+	# G54 E6b (bakımcı G54 (ii), tasarım): SyncIntervalSec 5min -> 10min (A14 değeri; e6-hiz §2.3); MaxFileSec=0: süreye bağlı dönüşüm
+	#  kapalı (açılışta saat derleme anından başlıyor; chrony adımından sonraki ilk yazmada varsayılan 1 ay kuralı yeni dosya +
+	#  karma tablosu yazdırıyordu, e6-hiz §4). SystemMaxFileSize 8M kalır (4M yalnız QEMU karşılaştırması).
+	printf '%s\n' "# Kara Kutu G53 E6 + G54 E6b yazma azaltma (kk_alan_az=1)" "[Journal]" "SystemMaxFileSize=8M" "SyncIntervalSec=10min" \
+		"MaxFileSec=0" "MaxLevelStore=info" > $E/systemd/journald.conf.d/zzzz-kk-alan-az.conf
+	printf '%s\n' "# Kara Kutu G53 E6 yazma azaltma (kk_alan_az=1): ana hatta blok aygitina yazan tek fs alan.img ic fs'i" \
+		"vm.dirty_expire_centisecs = 60000" "vm.dirty_writeback_centisecs = 0" > $E/sysctl.d/99-kk-alan-az.conf
+	# (G53 QEMU m2: 1500'de mmap'li journald dosyası süresi geçmiş kirli inode olarak 15 sn'de bir yeniden yazıldı; 0 = periyodik geri yazım
+	#  yok: yazma yalnız journald senkronunda (G54: 10 dk), commit'te ve umount'ta; dirty_background eşiği 8M dosyayla erişilmez)
+	for u in kk-anahat-ip-yedek kk-alan-izle kk-idle-durum kk-idle-bekci; do
+		mkdir -p $S/$u.service.d && printf '%s\n' "# Kara Kutu G53 E6 yazma azaltma: zamanlayici bilgi satirlari saklanmaz" \
+			"[Service]" "LogLevelMax=notice" > $S/$u.service.d/zz-kk-alan-az.conf || return 1
+	done
+	printf '%s\n' "# Kara Kutu G53 E6 yazma azaltma: ana makine yoklama seli (2 sn'de bir TCP) en cok 20 satir / 10 dk" \
+		"[Service]" "LogRateLimitIntervalSec=10min" "LogRateLimitBurst=20" > $E/systemd/system/ssh.service.d/zz-kk-alan-az.conf || return 1
+	return 0
+}
+debian_hazirla() {
+	[ $DEBIAN = 1 ] || { say "debian: atlandi (kk_debian=0 ya da eMMC yok)"; return 1; }
+	bul userdata || { say "debian: userdata bolumu yok; initramfs oturumunda kaliniyor"; return 1; }
+	UD=$BD
+	BI=$(blkid /dev/$UD 2>/dev/null)
+	case "$BI" in *'LABEL="kkdata"'*'TYPE="ext4"'*|*'TYPE="ext4"'*'LABEL="kkdata"'*) ;;
+		*) say "debian: /dev/$UD (ad=$BA) kkdata/ext4 degil ('$BI'); baglanmadi"; return 1;; esac
+	mkdir -p /kk/data /kk/ust $Y
+	# Süperblok (ofset 1024) s_feature_incompat (+0x60, LE32); bit 0x4 = RECOVER (needs_recovery). Yalnız okuma.
+	INC=$(dd if=/dev/$UD bs=1 skip=1120 count=4 2>/dev/null | hexdump -e '1/4 "%08x"')
+	case "$INC" in [0-9a-f]*) [ $(( 0x$INC & 4 )) -ne 0 ] && NR=evet || NR=hayir;; *) NR=okunamadi;; esac
+	say "debian: kkdata suberblok incompat=0x$INC needs_recovery=$NR (noload ile journal yuklenmez, geri oynatilmaz)"
+	mount -t ext4 -o ro,noload /dev/$UD /kk/data || { say "HATA: debian: /dev/$UD ro,noload baglanamadi"; return 1; }
+	say "debian: /dev/$UD (ad=$BA) kkdata ext4 -> /kk/data: $(grep ' /kk/data ' /proc/mounts | cut -d' ' -f4)"
+	A=/kk/data/kk/os/debian
+	# /sbin/init mutlak symlink (-> /lib/systemd/systemd); initramfs'te çözülemez, yalnız varlığına bakılır.
+	if [ ! -x $A/usr/lib/systemd/systemd ] || ! { [ -L $A/sbin/init ] || [ -e $A/sbin/init ]; }; then
+		say "HATA: debian: $A'da systemd/init yok"; umount /kk/data; return 1
+	fi
+	mount -t tmpfs -o size=256m,mode=0755 kk-ust /kk/ust && mkdir -p /kk/ust/upper /kk/ust/work || { say "HATA: debian: ust tmpfs"; umount /kk/data; return 1; }
+	mount -t overlay -o lowerdir=$A,upperdir=/kk/ust/upper,workdir=/kk/ust/work kk-kok $Y || {
+		say "HATA: debian: overlay baglanamadi"; umount /kk/ust; umount /kk/data; return 1; }
+	ust_yaz || { say "HATA: debian: ust katman yazilamadi"; umount $Y; umount /kk/ust; umount /kk/data; return 1; }
+	# Yalnız QEMU sınama imajında var (cihaz imajında bu dosya YOK): E6 sınama birimleri + QEMU geometrisi (KK_*).
+	[ -x /bin/kk-qemu-e6 ] && /bin/kk-qemu-e6 ust $Y
+	for d in data dev proc sys run; do mkdir -p $Y/$d; done
+	say "debian: overlay hazir: $(grep ' /kk/yeni ' /proc/mounts | cut -d' ' -f1-4)"
+	say "debian: ust katman: $(cd /kk/ust/upper && find . -type f -o -type l | tr '\n' ' ')"
+	return 0
+}
+debian_gec() {
+	# GERİ DÖNÜŞSÜZ: hata olursa reboot bootloader (normal reboot ana hatta açar).
+	gecfail() { say "HATA: $1; switch_root yapilmiyor, reboot bootloader"; sync; /bin/kk-reboot2 bootloader; while :; do sleep 60; done; }
+	killall telnetd 2>/dev/null
+	kill $WDPID 2>/dev/null
+	i=0; while [ $i -lt 40 ]; do
+		if ( exec 3>/dev/watchdog && printf . >&3 ) 2>/dev/null; then break; fi
+		sleep 0.5; i=$((i + 1))
+	done
+	if [ $i -ge 40 ]; then say "UYARI: watchdog son besleme yapilamadi (acik fd?)"; else say "watchdog: initramfs besleyici durdu; son besleme (bekleme ${i} x 0.5 sn); systemd 60 sn icinde devralmali"; fi
+	say "debian: /data (ro) /dev /proc /sys tasiniyor; exec switch_root $Y /sbin/init (up=$(up)s)"
+	mount --move /kk/data $Y/data || gecfail "mount --move /kk/data"
+	mount --move /dev $Y/dev || gecfail "mount --move /dev"
+	mount --move /proc $Y/proc || gecfail "mount --move /proc"
+	mount --move /sys $Y/sys || gecfail "mount --move /sys"
+	exec switch_root $Y /sbin/init
+	echo "<3>kk: HATA: switch_root dondu" > $Y/dev/kmsg 2>/dev/null
+	/bin/kk-reboot2 bootloader
+}
+if debian_hazirla; then
+	[ "$$" = 1 ] || { say "HATA: PID 1 degil; debian'a gecilmiyor"; }
+	[ "$$" = 1 ] && debian_gec
+fi
+
+# --- initramfs oturumu (Debian yoksa): USB durumunu izle, sınırda reboot bootloader ---
+say "initramfs oturumu: telnet $IP_DEV $PORT; init ${OTURUM}s'de reboot bootloader yapar"
+son=
+while [ "$(upi)" -lt $OTURUM ]; do
+	d="udc=$(rd /sys/class/udc/$UDC/state) telnet_baglanti=$(netstat -tn 2>/dev/null | grep -c ":$PORT .*ESTABLISHED")"
+	[ "$d" != "$son" ] && { say "oturum: $d (up=$(up)s)"; son=$d; }
+	sleep 5
+done
+if [ -n "$RM" ]; then
+	say "oturum siniri (${OTURUM}s) doldu: reboot bootloader"
+	sleep 1
+	/bin/kk-reboot2 bootloader
+	say "HATA: kk-reboot2 dondu (rc=$?)"
+else
+	say "HATA: reboot-mode yok; fastboot'a donulemez"
+fi
+# Buraya düşerse reboot YOK. Watchdog sert sınırı (WD_SINIR) dolunca besleme biter -> reset -> eRecovery.
+while :; do say "BEKLIYOR up=$(up)s"; sleep 30; done

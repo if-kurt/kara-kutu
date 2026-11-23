@@ -1,0 +1,76 @@
+dir   /bin  0755 0 0
+dir   /dev  0755 0 0
+dir   /proc 0755 0 0
+dir   /sys  0755 0 0
+nod   /dev/console 0600 0 0 c 5 1
+nod   /dev/kmsg    0644 0 0 c 1 11
+file  /init           initramfs/init        0755 0 0
+file  /bin/kk-idle-bekci initramfs/kk-idle-bekci 0755 0 0
+file  /bin/kk-alan    initramfs/kk-alan     0755 0 0
+file  /bin/kk-saglik  initramfs/kk-saglik   0755 0 0
+file  /bin/kk-wifi-yukle   initramfs/kk-wifi-yukle   0755 0 0
+file  /bin/kk-wifi-bekci2  initramfs/kk-wifi-bekci2  0755 0 0
+file  /bin/kk-zram   initramfs/kk-zram   0755 0 0
+file  /bin/kk-karsila initramfs/kk-karsila     0755 0 0
+file  /bin/kk-reboot2 initramfs/kk-reboot2      0755 0 0
+file  /bin/busybox    derleme/busybox-statik     0755 0 0
+slink /bin/sh      busybox 0777 0 0
+slink /bin/mount   busybox 0777 0 0
+slink /bin/cat     busybox 0777 0 0
+slink /bin/cut     busybox 0777 0 0
+slink /bin/grep    busybox 0777 0 0
+slink /bin/ls      busybox 0777 0 0
+slink /bin/tr      busybox 0777 0 0
+slink /bin/sleep   busybox 0777 0 0
+slink /bin/dmesg   busybox 0777 0 0
+slink /bin/wc      busybox 0777 0 0
+slink /bin/sort    busybox 0777 0 0
+slink /bin/uniq    busybox 0777 0 0
+slink /bin/head    busybox 0777 0 0
+slink /bin/basename busybox 0777 0 0
+slink /bin/sed      busybox 0777 0 0
+slink /bin/awk      busybox 0777 0 0
+slink /bin/dd       busybox 0777 0 0
+slink /bin/sha256sum busybox 0777 0 0
+slink /bin/blockdev busybox 0777 0 0
+slink /bin/ifconfig  busybox 0777 0 0
+slink /bin/ip        busybox 0777 0 0
+slink /bin/telnetd   busybox 0777 0 0
+slink /bin/hostname  busybox 0777 0 0
+slink /bin/mkdir     busybox 0777 0 0
+slink /bin/ln        busybox 0777 0 0
+slink /bin/umount    busybox 0777 0 0
+slink /bin/uname     busybox 0777 0 0
+slink /bin/netstat   busybox 0777 0 0
+slink /bin/nc        busybox 0777 0 0
+slink /bin/timeout   busybox 0777 0 0
+slink /bin/readlink  busybox 0777 0 0
+slink /bin/ping      busybox 0777 0 0
+slink /bin/kill      busybox 0777 0 0
+slink /bin/ps        busybox 0777 0 0
+slink /bin/free      busybox 0777 0 0
+slink /bin/tail      busybox 0777 0 0
+slink /bin/date      busybox 0777 0 0
+slink /bin/env       busybox 0777 0 0
+slink /bin/id        busybox 0777 0 0
+slink /bin/pwd       busybox 0777 0 0
+slink /bin/seq       busybox 0777 0 0
+slink /bin/stat      busybox 0777 0 0
+slink /bin/uptime    busybox 0777 0 0
+slink /bin/hexdump   busybox 0777 0 0
+slink /bin/od        busybox 0777 0 0
+slink /bin/find      busybox 0777 0 0
+slink /bin/pidof     busybox 0777 0 0
+slink /bin/pgrep     busybox 0777 0 0
+slink /bin/true      busybox 0777 0 0
+slink /bin/false     busybox 0777 0 0
+slink /bin/df        busybox 0777 0 0
+slink /bin/blkid     busybox 0777 0 0
+slink /bin/switch_root busybox 0777 0 0
+slink /bin/killall   busybox 0777 0 0
+slink /bin/cp        busybox 0777 0 0
+slink /bin/chmod     busybox 0777 0 0
+slink /bin/rm        busybox 0777 0 0
+slink /bin/mv        busybox 0777 0 0
+slink /bin/touch     busybox 0777 0 0
+slink /bin/rmdir     busybox 0777 0 0

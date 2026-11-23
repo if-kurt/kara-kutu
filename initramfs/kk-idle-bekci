@@ -1,0 +1,459 @@
+#!/bin/sh
+# kk-idle-bekci — Kara Kutu G48 P1 (G47 S2 KV3/KV6 + A0; tasarım work/g46/verim/TASARIM-kalici-verim.md §3-§4,
+# A0: work/g48/p1/RAPOR-p1.md §3)
+# cpuidle durumları DT'de "karakutu,varsayilan-kapali" ile her açılışta KAPALI başlar. Bu betik önceki açılışın
+# pstore kaydına (console-ramoops-0, dmesg-ramoops-*, pmsg-ramoops-0) bakarak döngü korumalı karar verir ve
+# durumları üç aşamada açar (A1 çekirdek uykusu, A2 A53 kümesi, A3 A73 kümesi), her aşamadan sonra sağlık denetimi.
+# G48 P1 A0 (A1'den önce, izin >= 1 ise; karar ACMA/KURU ise koşmaz): arka ışık kapatılır. i2c3 kapısı 'durum' okunur,
+# gerekiyorsa 'ac' (sürücüde tek seferlik; 4 girdilik MMIO beyaz listesi), 3-0011 aygıtı sleep + üst sınırla beklenir,
+# kimlik=1 kilit=0 denetlenir, 'kapat' (LM36274 0x04/0x05 <- 0) ve canlı geri okuma 0x04 = 0x05 = 0. A0 hatası ->
+# cpuidle hepsi kapalı (kapat), LM'ye başka yazma YOK, 'asama=A0 DUR' satırı. Arka ışığı yeniden açan yol YOK
+# (geri yazma yok); kapatılan arka ışık reboot ile bootloader'ın kurduğu 1252/2047'ye döner.
+#   kk-idle-bekci karar [initramfs|debian]  yalnız okur; kararı kmsg + pmsg + stdout'a yazar (AÇMA YOK)
+#   kk-idle-bekci uygula                     karar; AÇ ise A1..A<izin> aşamalı açma + sağlık; hata -> kapat + GERI ALINDI
+#   kk-idle-bekci kapat                      bütün state1/state2 disable <- 1 (geri okunur)
+#   kk-idle-bekci durum                      "kk-idle: durum seviye= izin= sayac=" satırı (10 dk'da bir, işaret)
+#   kk-idle-bekci sinifla <dizin>            yalnız sınıflandırma, stdout (KV8 4.9 betiği için; yazma yok)
+# YAZMA YALNIZ: cpu0-7/cpuidle/state1|state2/disable, /dev/kmsg, /dev/pmsg0, /run/kk-idle (tmpfs) ve A0'ın iki sysfs
+# tetiği: <i2c3-kapi>/kapi <- ac, 3-0011/kk_arka_isik <- kapat (syaz; başka dosya/değer reddedilir).
+# pstore dosyaları ASLA silinmez (silmek RAM bölgesini sıfırlar, kanıt kaybolur). pgrep -f yok; her bekleme
+# döngüsünde sleep + sayaç/süre üst sınırı; dmesg okuması timeout içinde.
+# Cmdline (yalnız kısaltır/kapatır): kk_idle=0 (açma) | kk_idle=kuru (yalnız karar) | kk_idle_seviye=1|2 |
+#   kk_idle_sifirla (taşınan izin/sayaç sıfırlanır).
+# D2 test bayrağı kk_idle_test_onceki=anormal YALNIZ DT'de /chosen/karakutu,idle-test özelliği varsa tanınır
+# (yalnız test varyantının DTB'si). Üretim DTB'sinde bayrak verilse de etkisizdir: "test=yok-sayildi".
+# KK_IDLE_* ortam değişkenleri yalnız birim/QEMU sınaması içindir; init ve systemd birimleri bunları vermez.
+set -u
+export LC_ALL=C
+trap '' PIPE
+SURUM=g48
+PS=${KK_IDLE_PSTORE:-/sys/fs/pstore}
+SY=${KK_IDLE_SYSFS:-/sys/devices/system/cpu}
+CMDL=${KK_IDLE_CMDLINE:-/proc/cmdline}
+DTC=${KK_IDLE_DT:-/proc/device-tree}/chosen
+YD=${KK_IDLE_Y:-/data/kk/durum/anahat-idle-yasak}
+KMSG=${KK_IDLE_KMSG:-/dev/kmsg}
+PMSG=${KK_IDLE_PMSG:-/dev/pmsg0}
+RUN=${KK_IDLE_RUN:-/run/kk-idle}
+SAGLIK=${KK_IDLE_SAGLIK_SN:-60}
+SERT=${KK_IDLE_SERT_SN:-90}
+ADIM=${KK_IDLE_ADIM_SN:-5}
+KTO=${KK_IDLE_KOMUT_SN:-10}
+DMESGK=${KK_IDLE_DMESG:-}
+# A0 (G48 P1): sysfs yolları (boş KAPI = /sys/bus/platform/devices/*i2c3-kapi*/kapi), 3-0011 bekleme üst sınırı (sn)
+KAPI=${KK_IDLE_KAPI:-}
+LMD=${KK_IDLE_LM:-/sys/bus/i2c/devices/3-0011/kk_arka_isik}
+A0BEK=${KK_IDLE_A0_BEKLE_SN:-30}
+SYAZ=${KK_IDLE_SYSFS_YAZ:-}	# YALNIZ birim: A0 tetik yazmalarını donanım modeline yönlendirir
+
+sayi() { case ${1:-x} in *[!0-9]*) return 1;; esac; [ ${#1} -le 4 ]; }
+for v in "$SAGLIK" "$SERT" "$ADIM" "$KTO" "$A0BEK"; do sayi "$v" || { echo "kk-idle-bekci: gecersiz sure '$v'" >&2; exit 64; }; done
+[ "$ADIM" -ge 1 ] && [ "$KTO" -ge 1 ] && [ "$SERT" -ge "$SAGLIK" ] || { echo "kk-idle-bekci: sure tutarsiz" >&2; exit 64; }
+
+up() { cut -d' ' -f1 /proc/uptime; }
+upi() { cut -d. -f1 /proc/uptime; }
+rd() { cat "$1" 2>/dev/null; }
+n0() { case ${1:-x} in *[!0-9]*) echo 0;; *) echo "$1";; esac; }
+log() {
+	m="kk-idle: $*"
+	echo "$m"
+	echo "<4>$m" >> "$KMSG" 2>/dev/null
+	if [ -c "$PMSG" ] || [ -f "$PMSG" ]; then echo "$m" >> "$PMSG" 2>/dev/null; fi
+	return 0
+}
+T=
+gecici() { T=$RUN/is.$$; mkdir -p "$T" 2>/dev/null || { T=/tmp/kk-idle.$$; mkdir -p "$T" || exit 70; }; }
+
+# ---------------- cmdline ----------------
+C_IDLE=; C_SEV=3; C_SIFIRLA=0; C_TEST=
+cmdline_oku() {
+	set -f
+	for a in $(cat "$CMDL" 2>/dev/null); do
+		case $a in
+		kk_idle=0) C_IDLE=0;;
+		kk_idle=kuru) C_IDLE=kuru;;
+		kk_idle_seviye=1) C_SEV=1;;
+		kk_idle_seviye=2) C_SEV=2;;
+		kk_idle_sifirla) C_SIFIRLA=1;;
+		kk_idle_test_onceki=anormal) C_TEST=anormal;;
+		kk_idle_test_onceki=*) C_TEST=gecersiz;;
+		esac
+	done
+	set +f
+}
+
+# ---------------- §4.2 sınıflandırma ----------------
+# Sonuç: ONCEKI (anahat|49|bilinmiyor) BITIS (temiz|anormal|-) ALT YETIM ND NB KAYNAK
+#        P_VAR P_IZIN P_SAYAC P_SEV P_GERI P_ONC (önceki açılışın son kk-idle durumu)
+hata_kodu() {	# $1: yalnız kernel satırları; ilk eşleşen sınıfın kısa kodu (uyarı tarayıcısını tetiklemeyen küçük harf)
+	grep -qF 'Kernel panic' "$1" && { echo panik; return; }
+	grep -qF 'SError' "$1" && { echo serror; return; }
+	grep -qF 'Internal error:' "$1" && { echo ic-hata; return; }
+	grep -qF 'Unable to handle kernel' "$1" && { echo bellek; return; }
+	grep -qF 'Oops' "$1" && { echo oops; return; }
+	grep -qF 'BUG:' "$1" && { echo bug; return; }
+	grep -qE 'soft lockup|hard LOCKUP' "$1" && { echo kilit; return; }
+	grep -qE 'rcu: INFO|self-detected stall|detected stalls' "$1" && { echo rcu-stall; return; }
+	grep -qE 'hung_task|blocked for more than' "$1" && { echo askida; return; }
+	return 0
+}
+olaylar() {	# $1: kaynak dosya -> "var izin sayac seviye geri onceki a0"
+	# a0: 0 = A0 etkisi yok; 1 = A0 başladı/tamam (arka ışık yazmaları olmuş olabilir); 2 = A0 yazmadan sonra DUR
+	grep -F 'kk-idle: ' "$1" 2>/dev/null | awk '
+	function deg(k,  i) { for (i = 1; i <= NF; i++) if (index($i, k "=") == 1) return substr($i, length(k) + 2); return "" }
+	function bos(x) { return x == "" ? "-" : x }
+	{ if (!sub(/^(.*\] )?kk-idle: /, "")) next }
+	$1 ~ /^karar=/ { izin = deg("izin"); sayac = deg("sayac"); onc = deg("onceki"); sev = 0; geri = 0; a0 = 0; var = 1; next }
+	$1 == "asama=A0" && ($2 == "basladi" || $2 == "tamam") { a0 = 1; next }
+	$1 == "asama=A0" && $2 == "DUR" { a0 = (deg("yazma") == "1") ? 2 : 0; next }
+	$1 ~ /^asama=A[123]$/ && $2 == "acildi" { sev = substr($1, 8, 1) + 0; next }
+	$1 == "GERI" && $2 == "ALINDI" { g = deg("asama"); if (g ~ /^A[123]$/) geri = substr(g, 2, 1) + 0; sev = 0; next }
+	$1 == "kesildi" || $1 == "kapat" || $1 == "acilmadi" { sev = 0; next }
+	$1 == "durum" { sev = deg("seviye"); izin = deg("izin"); sayac = deg("sayac"); x = deg("a0"); if (x ~ /^[012]$/) a0 = x + 0; var = 1; next }
+	END { printf "%d %s %s %s %d %s %d\n", var, bos(izin), bos(sayac), bos(sev), geri, bos(onc), a0 }'
+}
+sinifla() {
+	d=$1; ONCEKI=bilinmiyor; BITIS=-; ALT=konsol-yok; YETIM=0; ND=0; NB=0; KAYNAK=-; DESTEK=0
+	P_VAR=0; P_IZIN=-; P_SAYAC=-; P_SEV=0; P_GERI=0; P_ONC=-; P_A0=0
+	K=$T/k
+	if [ -d "$d" ]; then
+		if [ -s "$d/console-ramoops-0" ]; then tr -d '\000' < "$d/console-ramoops-0" > "$K" 2>/dev/null || : > "$K"; else : > "$K"; fi
+	else
+		: > "$K"; ALT=pstore-yok
+	fi
+	if [ -s "$K" ]; then
+		if grep -qF -e '[pid:' -e 'Linux version 4.9.' "$K"; then ONCEKI=49; ALT=-
+		elif grep -qF -e 'Linux version 6.12.' -e 'kk-idle:' -e '] kk: ' "$K"; then ONCEKI=anahat; ALT=-
+		else ALT=taninmayan-konsol
+		fi
+	fi
+	# dmesg kayıtları (yalnız destek kanıtı; K ile eşleşmeyen = bayat)
+	for f in "$d"/dmesg-ramoops-*; do
+		[ -f "$f" ] || continue
+		ND=$((ND + 1))
+		b=$(head -n 1 "$f" 2>/dev/null | tr -d '\000')
+		case $b in Panic#*|Oops#*|Emergency#*) ;; *) continue;; esac
+		grep -qF '[pid:' "$f" && continue
+		if [ "$ONCEKI" = 49 ]; then YETIM=1; continue; fi
+		s=
+		if [ "$ONCEKI" = anahat ]; then
+			s=$(tr -d '\000' < "$f" | grep -E '^(<[0-9]+>)?\[ *[0-9]+\.[0-9]+\] ' | tail -n 1 | sed 's/^<[0-9]*>//' | cut -c1-60)
+		fi
+		if [ -n "$s" ] && grep -qF -- "$s" "$K"; then DESTEK=1; else NB=$((NB + 1)); fi
+	done
+	# önceki açılışın kk-idle olayları: pmsg varsa ondan (KV6), yoksa konsoldan
+	src=$K; KAYNAK=konsol
+	if [ -s "$d/pmsg-ramoops-0" ] && grep -qF 'kk-idle: ' "$d/pmsg-ramoops-0" 2>/dev/null; then
+		tr -d '\000' < "$d/pmsg-ramoops-0" > "$T/p"; src=$T/p; KAYNAK=pmsg
+	fi
+	[ "$ONCEKI" = anahat ] || KAYNAK=-
+	if [ "$ONCEKI" = anahat ]; then
+		set -- $(olaylar "$src")
+		P_VAR=${1:-0}; P_IZIN=${2:--}; P_SAYAC=${3:--}; P_SEV=${4:-0}; P_GERI=${5:-0}; P_ONC=${6:--}; P_A0=${7:-0}
+		case $P_IZIN in 0|1|2|3) ;; *) P_IZIN=-;; esac
+		sayi "$P_SAYAC" || P_SAYAC=-
+		[ "$P_SAYAC" != - ] && [ "$P_SAYAC" -gt 99 ] && P_SAYAC=99
+		case $P_SEV in 0|1|2|3) ;; *) P_SEV=0;; esac
+		case $P_GERI in 0|1|2|3) ;; *) P_GERI=0;; esac
+		case $P_A0 in 0|1|2) ;; *) P_A0=0;; esac
+		son=$(grep -E '^\[ *[0-9]+\.[0-9]+\] ' "$K" | grep -vF 'pstore: backend (ramoops) writing error' | tail -n 1)
+		temiz=0
+		case $son in *'reboot: Restarting system'*|*'reboot: System halted'*|*'reboot: Power down'*) temiz=1;; esac
+		grep -E '^\[ *[0-9]+\.[0-9]+\] ' "$K" | grep -vE '^\[ *[0-9]+\.[0-9]+\] [^ ]+\[[0-9]+\]: ' | grep -vF 'kk-idle:' > "$T/kc"
+		kod=$(hata_kodu "$T/kc")
+		if [ "$kod" = panik ] || [ "$DESTEK" = 1 ]; then BITIS=anormal; ALT=panik
+		elif [ -n "$kod" ]; then BITIS=anormal; ALT=hata-satiri:$kod
+		elif [ "$P_GERI" -gt 0 ]; then BITIS=anormal; ALT=geri-alindi
+		elif [ "$P_A0" = 2 ]; then BITIS=anormal; ALT=a0-dur
+		elif [ $temiz = 0 ]; then BITIS=anormal; ALT=kesik
+		else
+			BITIS=temiz
+			if grep -qF 'kk: sigorta:' "$K"; then ALT=sigorta
+			elif grep -qE 'kk: anahat debian oturum siniri|oturum siniri \([0-9]+s\) doldu' "$K"; then ALT=oturum-siniri
+			else ALT=elle
+			fi
+		fi
+	elif [ "$ONCEKI" = 49 ]; then
+		[ "$YETIM" = 1 ] && ALT=yetim-cokus
+	fi
+}
+
+# ---------------- §4.3 karar tablosu ----------------
+# Sonuç: KARAR (AC|ACMA|KURU) ONC NEDEN IZIN SAYAC SEVE (önceki etkin seviye) EK (ek alanlar)
+karar_hesapla() {	# $1 = kip (initramfs|debian)
+	cmdline_oku
+	sinifla "$PS"
+	GERCEK=
+	TESTD=
+	if [ -n "$C_TEST" ]; then
+		if [ -e "$DTC/karakutu,idle-test" ] && [ "$C_TEST" = anormal ]; then
+			TESTD=anormal
+			case $ONCEKI in anahat) GERCEK=anahat-$BITIS/$ALT;; *) GERCEK=$ONCEKI/$ALT;; esac
+			ONCEKI=anahat; BITIS=anormal; ALT=test-bayragi
+		else
+			TESTD=yok-sayildi
+		fi
+	fi
+	SEVE=$P_SEV; [ "$P_GERI" -gt "$SEVE" ] && SEVE=$P_GERI
+	# A0: idle aşaması açılmadan önce yalnız A0'ın etkisi vardıysa (arka ışık), anormal bitişte bu "A0 seviyesi"
+	# sayılır: bir aşama geri = A0'ın altı = hiçbir şey (izin 0), sayaç +1 (A1-A3 ile aynı kural).
+	A0E=0; [ "$SEVE" = 0 ] && [ "$P_A0" -ge 1 ] && A0E=1
+	pi=$P_IZIN; ps=$P_SAYAC
+	[ "$C_SIFIRLA" = 1 ] && { pi=3; ps=0; }
+	case $ONCEKI in
+	bilinmiyor)
+		KARAR=ACMA; ONC=bilinmiyor; NEDEN=$ALT; IZIN=3; SAYAC=0;;
+	49)
+		if [ "$YETIM" = 1 ]; then KARAR=ACMA; ONC=49-yetim-cokus; NEDEN=yetim-cokus; IZIN=0; SAYAC=1
+		else KARAR=AC; ONC=49; NEDEN=4.9-zinciri; IZIN=3; SAYAC=0
+		fi;;
+	anahat)
+		ONC=anahat-$BITIS
+		[ "$pi" = - ] && pi=3
+		[ "$ps" = - ] && ps=0
+		if [ "$pi" = 0 ] && [ "$ps" -ge 2 ]; then
+			KARAR=ACMA; NEDEN=$ALT,zincir-yasagi-suruyor; IZIN=0; SAYAC=$ps
+		elif [ "$BITIS" = temiz ]; then
+			[ "$P_ONC" = 49-yetim-cokus ] && pi=3
+			KARAR=AC; NEDEN=$ALT; IZIN=$pi; SAYAC=0
+		elif [ "$SEVE" = 0 ] && [ "$A0E" = 0 ]; then
+			KARAR=ACMA; NEDEN=$ALT,seviye-0; IZIN=$pi; SAYAC=$ps
+		else
+			SAYAC=$((ps + 1))
+			if [ "$SAYAC" -ge 2 ]; then
+				KARAR=ACMA; NEDEN=$ALT,zincir-yasagi; IZIN=0
+			elif [ "$A0E" = 1 ]; then
+				KARAR=AC; NEDEN=$ALT,seviye-A0; IZIN=0
+			else
+				IZIN=$((SEVE - 1)); [ "$IZIN" -gt "$pi" ] && IZIN=$pi
+				KARAR=AC; NEDEN=$ALT,seviye-$SEVE
+			fi
+		fi;;
+	esac
+	[ "$C_SIFIRLA" = 1 ] && NEDEN=$NEDEN,sifirla
+	[ "$KARAR" = AC ] && [ "$IZIN" = 0 ] && { KARAR=ACMA; NEDEN=$NEDEN,izin-0; }
+	YDUR=yok
+	if [ "$1" = initramfs ]; then YDUR=denetlenmedi
+	elif [ -e "$YD" ]; then YDUR=var; KARAR=ACMA; NEDEN=4.9-bayragi; IZIN=0
+	fi
+	OLACAK=$KARAR
+	case $C_IDLE in
+	0) [ "$KARAR" = AC ] && NEDEN=$NEDEN,cmdline-0; KARAR=ACMA;;
+	kuru) KARAR=KURU;;
+	esac
+	EK="seviye_onceki=$SEVE kaynak=$KAYNAK d=$ND bayat=$NB y=$YDUR kip=$1 surum=$SURUM a0_onceki=$P_A0"
+	[ "$KARAR" = KURU ] && EK="$EK olacak=$OLACAK"
+	[ "$C_SEV" != 3 ] && EK="$EK sinir=$C_SEV"
+	[ -n "$TESTD" ] && EK="$EK test=$TESTD"
+	[ -n "$GERCEK" ] && EK="$EK gercek=$GERCEK"
+	return 0
+}
+sistem_log() {
+	n=0; k=0
+	for c in 0 1 2 3 4 5 6 7; do for s in 1 2; do
+		f=$SY/cpu$c/cpuidle/state$s/disable; [ -e "$f" ] || continue
+		n=$((n + 1)); [ "$(rd "$f")" = 1 ] && k=$((k + 1))
+	done; done
+	log "sistem gov=$(rd $SY/cpufreq/policy0/scaling_governor)/$(rd $SY/cpufreq/policy4/scaling_governor) surucu=$(rd $SY/cpuidle/current_driver) yonetici=$(rd $SY/cpuidle/current_governor_ro) kapali=$k/$n cpu=$(rd $SY/online)"
+}
+karar_log() {
+	log "karar=$KARAR onceki=$ONC neden=$NEDEN izin=$IZIN sayac=$SAYAC $EK"
+	sistem_log
+}
+
+# ---------------- canlı seviye, kapat, durum ----------------
+seviye_canli() {
+	a1=1; a2=1; a3=1; ACIKS=0
+	for c in 0 1 2 3 4 5 6 7; do
+		[ "$(rd $SY/cpu$c/cpuidle/state1/disable)" = 0 ] && ACIKS=$((ACIKS + 1)) || a1=0
+		if [ "$(rd $SY/cpu$c/cpuidle/state2/disable)" = 0 ]; then ACIKS=$((ACIKS + 1))
+		elif [ $c -le 3 ]; then a2=0
+		else a3=0
+		fi
+	done
+	SEVC=0; [ $a1 = 1 ] && { SEVC=1; [ $a2 = 1 ] && { SEVC=2; [ $a3 = 1 ] && SEVC=3; }; }
+}
+kapat_ic() {
+	n=0; ok=0
+	for c in 0 1 2 3 4 5 6 7; do for s in 1 2; do
+		f=$SY/cpu$c/cpuidle/state$s/disable; [ -e "$f" ] || continue
+		n=$((n + 1)); echo 1 > "$f" 2>/dev/null
+		[ "$(rd "$f")" = 1 ] && ok=$((ok + 1))
+	done; done
+	log "kapat yazilan=$n dogru=$ok up=$(up)"
+	[ "$n" = "$ok" ]
+}
+durum_log() {
+	seviye_canli
+	a=$(rd "$RUN/a0"); case $a in 0|1|2) ;; *) a=0;; esac
+	log "durum seviye=$SEVC izin=$IZIN sayac=$SAYAC up=$(up) acik=$ACIKS/16 a0=$a"
+}
+
+# ---------------- §3.2/§3.3 aşamalar ve sağlık ----------------
+asama_bilgi() {
+	case $1 in
+	1) L="0 1 2 3 4 5 6 7"; S=1; AD=cpu-sleep-0;;
+	2) L="0 1 2 3"; S=2; AD=cluster-sleep-0;;
+	3) L="4 5 6 7"; S=2; AD=cluster-sleep-1;;
+	esac
+}
+hata_say() {	# §3.3 S1 (G45 düzeltilmiş deseni; -i yok; sudo/systemd/kk-idle satırları hariç)
+	if [ -n "$DMESGK" ]; then timeout "$KTO" "$DMESGK" > "$T/dm" 2>/dev/null || return 1
+	else timeout "$KTO" dmesg > "$T/dm" 2>/dev/null || return 1
+	fi
+	# G59-L: Hi1102 vendor satırı "[SDIO]hii110x sdio driver in-stall-ing..." 'stall' alt dizgesine takılıp A1'i geri aldırıyordu
+	# (G59-K 2026-11-23 03:54). En dar istisna: YALNIZ bu satırın tam biçimi (tam satır çıpası; önek <N> ve [zaman] isteğe bağlı).
+	# Başka hiçbir şey muaf değil: sonuna/başına bir şey eklenmiş, başka sürücü etiketi, gerçek 'rcu stall' vb. sayılmaya devam eder.
+	grep -v -e sudo -e systemd -e 'kk-idle:' "$T/dm" | grep -vE '^(<[0-9]+>)?(\[ *[0-9]+\.[0-9]+\] )?\[SDIO\]hii110x sdio driver installing\.\.\.$' | grep -cE 'stall|Internal e|Oops|SError|BUG:|ockup|OCKUP|hung_task|blocked for more than'
+	return 0
+}
+asama() {
+	k=$1; asama_bilgi "$k"; AKTIF=$k
+	for c in $L; do
+		[ "$(rd $SY/cpu$c/cpuidle/state$S/name)" = "$AD" ] || { GNEDEN=ad-uyusmaz; return 1; }
+	done
+	[ "$(rd $SY/online)" = 0-7 ] || { GNEDEN=cpu-cevrimdisi; return 1; }
+	e0=$(hata_say); sayi "$e0" || { GNEDEN=s1-okunamadi; return 1; }
+	t0=$(upi)
+	YAZILDI=1
+	for c in $L; do
+		f=$SY/cpu$c/cpuidle/state$S/disable
+		echo 0 > "$f" 2>/dev/null || { GNEDEN=yazma-reddedildi; return 1; }
+		[ "$(rd "$f")" = 0 ] || { GNEDEN=geri-okuma; return 1; }
+	done
+	log "asama=A$k acildi up=$(up) cpu=$(echo $L | tr ' ' ,) durum=state$S($AD)"
+	gecen=0; i=0; imax=$((SAGLIK / ADIM + 3))
+	while [ "$gecen" -lt "$SAGLIK" ]; do
+		i=$((i + 1)); [ $i -le $imax ] || { GNEDEN=dongu-siniri; return 1; }
+		sleep "$ADIM"
+		gecen=$(( $(upi) - t0 ))
+		[ "$gecen" -le "$SERT" ] || { GNEDEN=sure-asimi; return 1; }
+		[ "$(rd $SY/online)" = 0-7 ] || { GNEDEN=cpu-cevrimdisi; return 1; }
+		e=$(hata_say); sayi "$e" || { GNEDEN=s1-okunamadi; return 1; }
+		[ "$e" -le "$e0" ] || { GNEDEN=hata-satiri; return 1; }
+	done
+	u=0; r=0
+	for c in $L; do
+		u=$((u + $(n0 "$(rd $SY/cpu$c/cpuidle/state$S/usage)")))
+		r=$((r + $(n0 "$(rd $SY/cpu$c/cpuidle/state$S/rejected)")))
+	done
+	log "asama=A$k saglikli up=$(up) sure=${gecen}s giris=$u red=$r"
+	return 0
+}
+# ---------------- G48 P1: A0 (arka ışık) ----------------
+# Yazma yalnız iki sysfs tetiği: $KAPI <- ac ve $LMD <- kapat. Başka dosya/değer bu işlevden geçemez.
+syaz() {
+	case "$1:$2" in "$KAPI:ac"|"$LMD:kapat") ;; *) log "asama=A0 izinsiz-tetik-reddedildi dosya=$1 deger=$2"; return 1;; esac
+	A0YAZ=1; a0_isaret 1
+	if [ -n "$SYAZ" ]; then "$SYAZ" "$1" "$2"; else echo "$2" > "$1"; fi
+}
+alan() {	# alan <ad> <metin>: "ad=deger" alanının değeri (yoksa boş)
+	for x in $2; do case $x in "$1"=*) echo "${x#*=}"; return 0;; esac; done
+	return 0
+}
+a0_isaret() { mkdir -p "$RUN" 2>/dev/null; echo "$1" > "$RUN/a0" 2>/dev/null; return 0; }
+a0() {
+	AKTIF=0
+	if [ -z "$KAPI" ]; then
+		for f in /sys/bus/platform/devices/*i2c3-kapi*/kapi; do [ -e "$f" ] && { KAPI=$f; break; }; done
+	fi
+	kd=; [ -n "$KAPI" ] && [ -e "$KAPI" ] && kd=$(rd "$KAPI")
+	case $kd in
+	durum=HAZIR*) kdur=HAZIR;; durum=BEKLIYOR*) kdur=BEKLIYOR;; durum=DUR*) kdur=DUR;; '') kdur=yok;; *) kdur=taninmayan;;
+	esac
+	e0=$(hata_say); sayi "$e0" || { GNEDEN=s1-okunamadi; return 1; }
+	a0_isaret 1
+	log "asama=A0 basladi up=$(up) kapi=$kdur"
+	case $kdur in
+	HAZIR) ;;
+	BEKLIYOR)
+		syaz "$KAPI" ac; r=$?
+		kd=$(rd "$KAPI")
+		case $kd in durum=HAZIR*) ;; *) GNEDEN=kapi-ac-$(alan durum "$kd" | cut -c1-12)-rc$r; return 1;; esac
+		log "asama=A0 kapi-acildi up=$(up) kapi_yazma=$(alan yazma "$kd") plan=$(alan plan "$kd")";;
+	yok) GNEDEN=kapi-yok; return 1;;
+	*) GNEDEN=kapi-$kdur; return 1;;
+	esac
+	i=0
+	while [ ! -e "$LMD" ]; do
+		i=$((i + 1)); [ $i -le "$A0BEK" ] || { GNEDEN=aygit-yok-${A0BEK}s; return 1; }
+		sleep 1
+	done
+	ld=$(rd "$LMD")
+	case " $ld " in *" kimlik=1 kilit=0 "*) ;; *) GNEDEN=lm-hazir-degil-kimlik$(alan kimlik "$ld")-kilit$(alan kilit "$ld"); return 1;; esac
+	syaz "$LMD" kapat; r=$?
+	ld=$(rd "$LMD")
+	g4=$(alan 04 "${ld#*canli }"); g5=$(alan 05 "${ld#*canli }")
+	[ $r = 0 ] || { GNEDEN=lm-kapat-rc$r-04=$g4-05=$g5; return 1; }
+	case $ld in durum=kapali*) ;; *) GNEDEN=lm-durum-$(alan durum "$ld"); return 1;; esac
+	[ "$g4" = 0 ] && [ "$g5" = 0 ] || { GNEDEN=geri-okuma-04=$g4-05=$g5; return 1; }
+	e=$(hata_say); sayi "$e" || { GNEDEN=s1-okunamadi; return 1; }
+	[ "$e" -le "$e0" ] || { GNEDEN=hata-satiri; return 1; }
+	log "asama=A0 tamam up=$(up) bekleme=${i}s 04=$g4 05=$g5 lm_yazma=$(alan yazma "$ld") kapi=$kdur"
+	return 0
+}
+ACIK_BASLADI=0; YAZILDI=0; BASARI=0; SINYAL=0; AKTIF=0; GNEDEN=; KILIT=0; A0YAZ=0
+cikis() {
+	rc=$?
+	trap - EXIT INT TERM HUP
+	if [ "$ACIK_BASLADI" = 1 ] && [ "$BASARI" != 1 ]; then
+		kapat_ic
+		if [ "$SINYAL" = 1 ]; then log "kesildi asama=A$AKTIF neden=sinyal up=$(up)"
+		elif [ "$AKTIF" = 0 ]; then
+			# A0 hatası: cpuidle hepsi kapalı (yukarıda), LM'ye başka yazma YOK. Yazma olduysa sonraki açılış ceza sayar.
+			if [ "$A0YAZ" = 1 ]; then a0_isaret 2; else a0_isaret 0; fi
+			log "asama=A0 DUR neden=${GNEDEN:-beklenmeyen-cikis} yazma=$A0YAZ up=$(up)"
+		elif [ "$YAZILDI" = 1 ]; then log "GERI ALINDI asama=A$AKTIF neden=${GNEDEN:-beklenmeyen-cikis} up=$(up)"
+		else log "acilmadi asama=A$AKTIF neden=${GNEDEN:-beklenmeyen-cikis} up=$(up)"
+		fi
+		[ $rc = 0 ] && rc=1
+	fi
+	[ -n "$T" ] && rm -rf "$T"
+	[ "$KILIT" = 1 ] && rmdir "$RUN/kilit" 2>/dev/null
+	exit $rc
+}
+
+# ---------------- alt komutlar ----------------
+ak=${1:-}
+case $ak in
+karar)
+	kip=${2:-debian}; case $kip in initramfs|debian) ;; *) echo "kullanim: kk-idle-bekci karar [initramfs|debian]" >&2; exit 64;; esac
+	gecici; trap cikis EXIT
+	karar_hesapla "$kip"; karar_log
+	exit 0;;
+uygula)
+	mkdir -p "$RUN" 2>/dev/null
+	mkdir "$RUN/kilit" 2>/dev/null || { log "uygula: zaten calisiyor (kilit $RUN/kilit); cikiliyor"; exit 0; }
+	KILIT=1; gecici
+	trap cikis EXIT
+	trap 'SINYAL=1; exit 143' INT TERM HUP
+	karar_hesapla debian; karar_log
+	if [ "$KARAR" != AC ]; then durum_log; exit 0; fi
+	hedef=$IZIN; [ "$C_SEV" -lt "$hedef" ] && hedef=$C_SEV
+	ACIK_BASLADI=1
+	# A0 (G48 P1): izin >= 1 (karar AC) ise A1'den önce; hata -> cikis: kapat + 'asama=A0 DUR'
+	[ "$hedef" -ge 1 ] || exit 0
+	a0 || exit 1
+	k=1
+	while [ $k -le "$hedef" ]; do
+		asama $k || exit 1
+		k=$((k + 1))
+	done
+	BASARI=1
+	durum_log
+	exit 0;;
+kapat)
+	gecici; trap cikis EXIT
+	kapat_ic; exit $?;;
+durum)
+	gecici; trap cikis EXIT
+	karar_hesapla debian; durum_log; exit 0;;
+sinifla)
+	[ $# -eq 2 ] || { echo "kullanim: kk-idle-bekci sinifla <dizin>" >&2; exit 64; }
+	gecici; trap cikis EXIT
+	sinifla "$2"
+	echo "onceki=$ONCEKI bitis=$BITIS alt=$ALT yetim=$YETIM d=$ND bayat=$NB destek=$DESTEK seviye=$P_SEV geri=$P_GERI izin=$P_IZIN sayac=$P_SAYAC kaynak=$KAYNAK"
+	exit 0;;
+*)
+	echo "kullanim: kk-idle-bekci karar [initramfs|debian] | uygula | kapat | durum | sinifla <dizin>" >&2; exit 64;;
+esac

@@ -1,0 +1,31 @@
+#!/bin/sh
+# Kara Kutu G59-L: zram takasi (zstd, 2 GiB mantiksal, sikistirilmis bellek <= 1 GiB, oncelik 100). Diske (eMMC) HICBIR sey yazilmaz.
+# Ana hat Debian'inda sistemd birimi (init yazar, yalniz ust katman tmpfs) calistirir; cikis HER ZAMAN 0 (birim 'failed' olmasin).
+# Sinama icin ortam degiskenleri (yalniz yerel birim testi): KK_ZRAM_SYS KK_ZRAM_DEV KK_ZRAM_SWAPS KK_ZRAM_VM KK_ZRAM_KMSG
+#   KK_ZRAM_MKSWAP KK_ZRAM_SWAPON KK_ZRAM_SWAPOFF KK_ZRAM_BOYUT KK_ZRAM_MEMLIM.
+# Kapatma: bootarg kk_zram=0 (init birimi hic yazmaz). Bu betik cmdline okumaz.
+Z=${KK_ZRAM_SYS:-/sys/block/zram0}; DEV=${KK_ZRAM_DEV:-/dev/zram0}; SW=${KK_ZRAM_SWAPS:-/proc/swaps}
+VM=${KK_ZRAM_VM:-/proc/sys/vm}; KM=${KK_ZRAM_KMSG:-/dev/kmsg}
+MKS=${KK_ZRAM_MKSWAP:-mkswap}; SON=${KK_ZRAM_SWAPON:-swapon}; SOF=${KK_ZRAM_SWAPOFF:-swapoff}
+BOYUT=${KK_ZRAM_BOYUT:-2147483648}; MEMLIM=${KK_ZRAM_MEMLIM:-1073741824}; ONCELIK=100; SWAPPINESS=100
+say() { echo "<4>kk: zram: $*" >> "$KM" 2>/dev/null || echo "kk: zram: $*"; }
+sw_zram() { grep -q '^/dev/zram' "$SW" 2>/dev/null; }
+disk_takas() { awk 'NR > 1 && $1 !~ /^\/dev\/zram/ {print $1}' "$SW" 2>/dev/null; }
+
+[ -d "$Z" ] || { say "zram0 yok ($Z); islem yok"; exit 0; }
+if sw_zram; then say "zaten etkin; islem yok ($(grep '^/dev/zram' "$SW" | tr -s ' \t' ' '))"; exit 0; fi
+# eMMC'ye takas yok kurali: baska (disk) takas etkinse kapat ve yaz (kapatmak diske yazmaz; sayfalar RAM'e doner)
+for d in $(disk_takas); do
+	say "UYARI: diskte takas etkin: $d -> swapoff"; $SOF "$d" 2>/dev/null || say "UYARI: swapoff $d basarisiz"
+done
+# algoritma: disksize'tan ONCE; secilen [zstd] olarak okunmali
+{ echo zstd > $Z/comp_algorithm; } 2>/dev/null
+case $(cat $Z/comp_algorithm 2>/dev/null) in *'[zstd]'*|zstd) ;; *) say "UYARI: zstd secilemedi ($(cat $Z/comp_algorithm 2>/dev/null)); takas kurulmadi"; exit 0;; esac
+{ echo "$MEMLIM" > $Z/mem_limit; } 2>/dev/null || say "UYARI: mem_limit yazilamadi (sinir yok)"
+{ echo "$BOYUT" > $Z/disksize; } 2>/dev/null
+[ "$(cat $Z/disksize 2>/dev/null)" = "$BOYUT" ] || { say "UYARI: disksize $BOYUT yazilamadi (okunan $(cat $Z/disksize 2>/dev/null)); takas kurulmadi"; exit 0; }
+$MKS -L kk-zram "$DEV" > /dev/null 2>&1 || { say "UYARI: mkswap $DEV basarisiz; takas kurulmadi"; exit 0; }
+$SON -p $ONCELIK "$DEV" 2>/dev/null || { say "UYARI: swapon $DEV basarisiz"; exit 0; }
+{ echo $SWAPPINESS > $VM/swappiness; echo 0 > $VM/page-cluster; } 2>/dev/null
+say "etkin: comp=zstd disksize=$BOYUT mem_limit=$MEMLIM oncelik=$ONCELIK swappiness=$(cat $VM/swappiness 2>/dev/null) page-cluster=$(cat $VM/page-cluster 2>/dev/null); diskte takas: $(disk_takas | wc -l)"
+exit 0

@@ -1,0 +1,442 @@
+#!/bin/sh
+# Kara Kutu G52 E6-0 + G53 ÖNERİSİ (kurulmadı; bakımcı onayı gerekir): ana hat Debian'ında alan.img iç ext4'ünün açılışta bağlanması.
+# Kaynak: initramfs /bin/kk-alan (imajın sha'sına girer); init (kk_alan=1|ro iken) üst katmana /usr/local/sbin/kk-alan olarak
+# kopyalar ve birimleri yazar. Alt katmana (4.9 kökü) hiçbir şey yazılmaz.
+#   kk-alan bagla   kk-alan.service ExecStart (sysinit, journald'dan sonra, systemd-journal-flush'tan ÖNCE)
+#   kk-alan kapat   kk-alan.service ExecStop (her düzenli kapanışta) ya da izle'nin kararı; tekrar çağrılabilir
+#   kk-alan izle    kk-alan-izle.timer (60 sn); yalnız okur, gerekirse kapat
+#   kk-alan durum   yalnız okur
+# KALICI OLAN YALNIZ: iç fs /journal (bind -> /var/log/journal) + /kk/durum/sayac (4 KiB, kirli kapanış sayacı).
+# Kipler (cmdline kk_alan=, cihazda yalnız DT bootargs): 1 = rw (pencere bu betikle AÇILIR), ro = inceleme (pencere açılmaz),
+#   yok/0 = hiçbir şey. rw istenip ardışık kirli kapanış >= 3 ya da ardışık açıklanamayan düzeltme >= 3 ise ro'ya düşer.
+# e2fsck: yalnız -p (gerekirse -f -p); -y ASLA. rc 0/1 -> bağla; diğer -> BOZUK (bağlanmaz, pencere kilitlenir).
+# Yazma yalnız: kk_yazma (ac/kapat), rw loop üzerinden iç fs, /run/kk-alan, /dev/kmsg. kkdata'ya/p68'e doğrudan yazma YOK.
+# KK_* değişkenleri YALNIZ QEMU/yerel sınama içindir (cihazda birim ortamında yok).
+# G53 (A12 kök çözümüne göre): (1) A12 ön koşul: /sys/block/mmcblk0/kk_a12 "kapi=etkin red=0" değilse bağlanmaz.
+#   (2) A12-1: loop TÜM DİSK (mmcblk0) üzerinde mutlak ofsetle (W_BAS*512); p68 pencere açılmadan ÖNCE BLKROSET ile ro
+#   (blockdev --setro): kkdata ext4'ünün hata yolu (ext4_handle_error -> ext4_commit_super) bdev ro iken süper bloğa yazmaz;
+#   loop'un hata durumu (errseq) kkdata'nın bdev eşlemesinden ayrılır. (3) izle: kk_a12 red > 0 -> kapat A12-RED + acil.
+#   (4) kk_alan_az=1 (yalnız günlük kullanım imajı): bağlama commit=300,lazytime (yazma azaltma; TASARIM-E6 §8.5).
+#   (5) Sorun satırları stdout'a "<4>" önekiyle (journald uyarı düzeyinde saklar; LogLevelMax=notice birimlerinde kaybolmaz).
+# G54 E6b: (6) kk_alan_az=1 iken izle oturum bütçesi D6'ya bağlı (tetik 7168 sektör; hesap az_oku altında). BAGLANDI satırı
+#   az kipinde "butce=<tetik>" taşır.
+# G55 E6U: (7) SAAT (bakımcı G55 (ii), aynen): "Saat dosyası alanın içinde (4 KiB, yerinde O_DIRECT). Açılışta journald'ın
+#   kalıcı günlüğe aktarımından önce geri yüklenir; kapanışta ve en çok 10 dakikada bir güncellenir." Dosya iç fs
+#   /kk/durum/saat (sayacın yanında). Geri yükleme bagla'da (kk-alan.service Before=systemd-journal-flush.service; flush
+#   drop-in'i After=kk-alan.service -> flush bagla bitmeden başlamaz). Güncelleme izle'de (>= 600 sn arayla) ve kapat'ta,
+#   yalnız rw iken. (8) D6 (az kipi) 12288 -> 20480 (E6U oturumu); bekçi tetiği aynı formülle 15360.
+# G56 E6U-2 bulgusu: saat t'ye (saniye başı) kurulunca kapanıştaki son girdi (t,9xx) "gelecekte" kaldı; journald 252
+#   (journal-file.c tail_entry_realtime > now -> ETXTBSY) önceki system.journal'ı .journal~ yaptı. (9) Geri yükleme t+1'e.
+# G57 (tasarım G57): (10) geri yüklenecek saat = max(dosya t, etkin journal başlıklarının tail_entry_realtime'ı) + 1 sn; kapanışta
+#   saat dosyasından sonra günlüğe düşen girdiler ve kirli kapanış (dosya <= 600 sn eski) da kapsanır. Yalnız okuma.
+# G58 G-1 (tasarım G58, O-G1-5): (11) KOVA (token bucket) yalnız günlük kipte (cmdline kk_gunluk=1): oturum bütçesi (BUTCE_OTURUM)
+#   yerine hız KOVA_HIZ = 20480 sektör/saat, patlama KOVA_PATLAMA = 20480 sektör; kova bağlamada DOLU. Saat /proc/uptime (monoton,
+#   duvar saati değil). Her izle turunda (önce dol + kırp, sonra yazmayı düş = tutucu sıra):
+#     seviye = min(PATLAMA, seviye + HIZ * dt / 3600) - (lw - lw_once)        [birim sektör x 3600: tamsayı, yuvarlama yok]
+#   seviye < KOVA_PAY (= AZ_KAPANIS_PAY + AZ_SENK_PAY = 5120) -> uyar + kapat BUTCE (bugünkü BUTCE davranışı AYNEN: alan kapanır,
+#   günlük /run'a döner, acil reboot YOK). t -> 0'da tetik = PATLAMA - PAY = 15360 = bugünkü az kipi tetiği (D6 20480 - 5120).
+#   Güvence (D6'nın kova karşılığı): her [s, s+T] aralığında iç fs yazması <= PATLAMA + HIZ*T/3600 (kapanış yazması dahil; iki tur
+#   arası <= AZ_SENK_PAY, kapanış <= AZ_KAPANIS_PAY varsayımıyla — bugünkü D6 formülünün varsayımları). Durum /run/kk-alan/kova
+#   "<t> <lw> <seviye_u>"; kayıp/bozuksa seviye = PATLAMA - lw (dolum kredisi yok; tutucu). 10 dk penceresi (131072) ve DOLU aynen.
+#   kk_gunluk YOKKEN (D1 oturum sınırlı test imajları) bütçe kodu ve değerleri G57 ile AYNI (az: D6 20480 -> tetik 15360).
+#   KK_KOVA_HIZ / KK_KOVA_PATLAMA, KK_UPTIME, KK_KMSG, KK_PMSG yalnız yerel sınama/QEMU içindir (cihazda birim ortamında yok).
+set -u
+PATH=${KK_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}	# KK_PATH yalnız yerel sınama (taklit araçlar)
+MOD=${1:-durum}
+case $MOD in bagla|kapat|izle|durum) ;; *) echo "kullanim: kk-alan bagla|kapat|izle|durum" >&2; exit 64;; esac
+R=${KK_RUN:-/run/kk-alan}; mkdir -p "$R"
+UPF=${KK_UPTIME:-/proc/uptime}; KMSG=${KK_KMSG:-/dev/kmsg}; PMSG=${KK_PMSG:-/dev/pmsg0}	# G58: yerel sınama için yol (cihazda varsayılan)
+W_BAS=${KK_W_BAS:-21282816}; W_SAY=2097152; W_SON=$((W_BAS + W_SAY))
+UD_BAS=${KK_UD_BAS:-16826368}; UD_BOY=${KK_UD_BOY:-227450880}; KART=${KK_KART:-244277248}; NO=${KK_NO:-68}
+PUUID=${KK_PUUID:-@@GUID@@}
+DT=${KK_DT:-/proc/device-tree/soc/mmc@ff3e6000}; DSK=${KK_DSK:-mmcblk0}; PRT=${KK_PRT:-mmcblk0p68}; SYS=${KK_SYS:-/sys}; DEV=${KK_DEV:-/dev}
+ALAN=${KK_ALAN:-/data/kk/anahat/alan.img}; KKD=${KK_KKD:-/data}; DOSYA=${KK_DOSYA:-1}
+IUUID=${KK_IUUID:-@@GUID@@}; IAD=kk-anahat
+OZ="has_journal ext_attr resize_inode dir_index filetype extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum"
+MNT=${KK_MNT:-/alan}; JD=${KK_JD:-/var/log/journal}; SAYAC=/kk/durum/sayac
+KIRLI_SINIR=3; DUZ_SINIR=3
+BUTCE_OTURUM=${KK_BUTCE_OTURUM:-524288}	# sektör: oturum başına 256 MiB
+BUTCE_10DK=${KK_BUTCE_10DK:-131072}	# sektör: son 10 dk'da 64 MiB
+DOLU_KIB=${KK_DOLU_KIB:-614400}	# iç fs kullanılan > 600 MiB
+IBOY=1073741824; PB=$(( (W_BAS - UD_BAS) / 8 )); OFS=$((PB * 4096))
+DOFS=$((W_BAS * 512))	# G53 A12-1: loop tüm diskte, mutlak ofset (= p68 başı + OFS)
+KY=$SYS/block/$DSK/kk_yazma; KA=$SYS/block/$DSK/kk_a12; P=$SYS/class/block/$PRT
+BOOT=$(cut -c1-8 /proc/sys/kernel/random/boot_id 2>/dev/null)
+up() { cut -d' ' -f1 "$UPF"; }
+upi() { cut -d. -f1 "$UPF"; }
+say() { echo "kk-alan: $*"; }
+uyar() { echo "<4>kk-alan: $*"; }	# journald uyarı düzeyi (SyslogLevelPrefix)
+ilan() { uyar "$*"; { echo "<4>kk-alan: $*" > "$KMSG"; } 2>/dev/null; [ -c "$PMSG" ] && { echo "kk-alan: $*" > "$PMSG"; } 2>/dev/null; return 0; }
+durum_yaz() { echo "$* up=$(up)" > "$R/durum"; }
+q() { od -An -v -tu1 "$DT/karakutu,$1" | awk '{for(i=1;i<=NF;i++){v=v*256+$i;if(++n%4==0){printf "%s%.0f",s,v;s=" ";v=0}}}END{print ""}'; }
+r() { tr -d '\000' < "$DT/karakutu,$1"; }
+st() { set -- $(cat "$SYS/block/$DSK/stat"); echo "$5 $7 ${12} ${16}"; }	# yazma_io yazma_sektor discard_io flush_io
+lws() { set -- $(cat "$SYS/block/${1##*/}/stat"); echo "$7"; }	# loop yazma sektörü
+oku4k() { dd if="$1" bs=4096 skip=$2 count=${3:-1} iflag=direct 2>/dev/null | sha256sum | cut -c1-64; }
+lp() { for b in "$SYS"/block/loop*/loop/backing_file; do [ -f "$b" ] && case "$(cat "$b")" in "$DEV/$PRT"|"$DEV/$DSK") b=${b%/loop/backing_file}; echo "$DEV/${b##*/}";; esac; done; }	# p68 ya da tüm diske bağlı loop'lar
+esit() { [ "$2" = "$3" ] || dur "$1: '$2' (beklenen '$3')"; say "ok $1 = $2"; }
+lo_bak() { y=$SYS/block/${2##*/}; esit "$1" "$(cat $y/ro) $(cat $y/loop/offset) $(cat $y/loop/sizelimit) $(cat $y/loop/dio) $(cat $y/loop/backing_file)" "$3 $DOFS $IBOY 1 $DEV/$DSK"; }
+a12() { alan "$(cat "$KA" 2>/dev/null)" "$1"; }	# kk_a12: kapi=etkin red=N yaz=.. sifir=.. sil=.. mmap=.. son=..
+az_oku() { for a in ${KK_CMDLINE:-$(cat /proc/cmdline)}; do [ "$a" = kk_alan_az=1 ] && { echo 1; return; }; done; echo 0; }
+# G54 E6b: az kipinde (kk_alan_az=1) oturum bütçesi D6'ya bağlanır. D6 (bakımcı G54 (ii), tasarım: kesin üst sınır) =
+#   "KAPANDI ... w_sec <= 12288 sektör (6 MiB)". Bekçi 60 sn'de bir bakar ve kapat'ın kendisi de yazar (journald relinquish +
+#   umount + sayaç); bu yüzden tetik D6'nın kendisi değil, D6 eksi iki pay:
+#     AZ_KAPANIS_PAY = 3072  kapanış yazması üst değeri (e6-hiz §5.2; QEMU azsaat kapanışı 2056)
+#     AZ_SENK_PAY    = 2048  bir izle aralığına (60 sn) düşebilecek en çok bir journald senkronu (e6-hiz §5.2; QEMU 1408/1200)
+#   tetik = 12288 - 3072 - 2048 = 7168 sektör: lw > 7168 -> uyar + kapat BUTCE (acil reboot yok; oturum alansız sürer).
+#   Önceki değer (G52/G53, az kipinde de): BUTCE_OTURUM 524288 (256 MiB) — yalnız sigorta; E6a'nın D6'sı (51200) yalnız test
+#   ölçütüydü, kodda yoktu. az kipi dışında (kk_alan_az yok) bütçe değişmedi (524288). KK_BUTCE_OTURUM yalnız sınama içindir.
+# G55 E6U: D6 = 20480 sektör (10 MiB; tasarım G55: "D6 <= 20 480 sektör bu oturum için", 1740 sn). Formül ve paylar E6b ile
+#   aynı: tetik = 20480 - 3072 - 2048 = 15360 sektör. (E6b değeri: D6 12288 -> tetik 7168.)
+D6_AZ=20480; AZ_KAPANIS_PAY=3072; AZ_SENK_PAY=2048
+[ "$(az_oku)" = 1 ] && BUTCE_OTURUM=${KK_BUTCE_OTURUM:-$((D6_AZ - AZ_KAPANIS_PAY - AZ_SENK_PAY))}
+# G58 G-1 KOVA (yalnız kk_gunluk=1; ayrıntı üstte (11)). Değerler tasarım G58: hız 20480/sa, patlama 20480 (E6U-1 kararlı ≈ 11400/sa).
+gunluk_oku() { for a in ${KK_CMDLINE:-$(cat /proc/cmdline)}; do [ "$a" = kk_gunluk=1 ] && { echo 1; return; }; done; echo 0; }
+tam() { case ${1#-} in ''|*[!0-9]*) return 1;; esac; [ ${#1} -le 15 ]; }
+KOVA=$(gunluk_oku); KOVA_HIZ=${KK_KOVA_HIZ:-20480}; KOVA_PATLAMA=${KK_KOVA_PATLAMA:-20480}; KOVA_PAY=$((AZ_KAPANIS_PAY + AZ_SENK_PAY))
+tam "$KOVA_HIZ" && tam "$KOVA_PATLAMA" && [ "$KOVA_HIZ" -ge 0 ] && [ "$KOVA_HIZ" -le 100000000 ] && [ "$KOVA_PATLAMA" -gt "$KOVA_PAY" ] \
+	&& [ "$KOVA_PATLAMA" -le 100000000 ] || { KOVA_HIZ=20480; KOVA_PATLAMA=20480; }	# geçersiz sınama değeri -> cihaz değeri
+KOVA_U=$((KOVA_PATLAMA * 3600))
+kova_adim() {	# $1 t (uptime sn) $2 lw (loop yazma sektörü) -> KS (seviye, sektör x 3600), KD (ok|yeniden|tutarsiz); $R/kova yazar
+	KD=ok; set -- "$1" "$2" $(cat "$R/kova" 2>/dev/null)
+	if [ $# = 5 ] && tam "$3" && tam "$4" && tam "$5" && [ "$3" -ge 0 ] && [ "$3" -le "$1" ] && [ "$4" -ge 0 ] && [ "$5" -le "$KOVA_U" ]; then
+		kt=$3; kl=$4; KS=$5
+	else KD=yeniden; kt=$1; kl=0; KS=$KOVA_U; fi	# durum yok/bozuk: dolum kredisi yok, bağlamadan beri bütün yazma düşülür
+	dw=$(( $2 - kl )); [ "$dw" -ge 0 ] || { KD=tutarsiz; dw=$2; }	# sayaç geriledi (olmamalı): bütün sayaç düşülür
+	KS=$(( KS + KOVA_HIZ * ($1 - kt) )); [ "$KS" -le "$KOVA_U" ] || KS=$KOVA_U
+	KS=$(( KS - dw * 3600 ))
+	echo "$1 $2 $KS" > "$R/kova"
+}
+kova_yaz() { echo "hiz${KOVA_HIZ}/sa,patlama${KOVA_PATLAMA},pay${KOVA_PAY}"; }
+dh() { dumpe2fs -h "$1" 2>/dev/null | awk -F': *' '/^Filesystem volume name:/{a=$2} /^Filesystem UUID:/{u=$2} /^Filesystem state:/{d=$2} /^Filesystem features:/{k=($2 ~ /needs_recovery/);o=$2;gsub(/ ?needs_recovery/,"",o)} /^Mount count:/{m=$2} END{printf "ad=%s uuid=%s durum=%s kurtarma=%d baglama=%s|%s\n", a, u, d, k, m, o}'; }
+alan() { echo " $1 " | tr ' ' '\n' | sed -n "s/^$2=//p" | head -n 1; }
+sinir() { echo "$(oku4k "$DEV/$PRT" $((PB - 256)) 256) $(oku4k "$DEV/$PRT" $((PB + 262144)) 256)"; }	# pencerenin hemen önü/arkası (1'er MiB, kkdata)
+kip_oku() { for a in ${KK_CMDLINE:-$(cat /proc/cmdline)}; do case $a in kk_alan=1) echo 1; return;; kk_alan=ro) echo ro; return;; esac; done; echo 0; }
+sayac_kayit() {	# $1 kirli $2 duz $3 durum $4 bag $5 kirli_top $6 neden -> 4096 B (tek satır, boşlukla dolgu)
+	printf '%-4095s\n' "KKSAYAC 1 kirli=$1 duz=$2 durum=$3 bag=$4 kirli_top=$5 son_boot=$BOOT son_neden=$6 up=$(up)"
+}
+# G55 SAAT: /kk/durum/saat, 4096 B, tek satır (boşlukla dolgu, sayaçla aynı desen; debugfs/dd ile okunur):
+#   "KKSAAT 1 t=<epoch sn> boot=<boot_id 8> up=<uptime> neden=<izle|kapat:NEDEN> sag=<sha256(gövde) ilk 16>"
+#   gövde = " sag=" öncesi; sürüm alanı "1" (başka sürüm -> bozuk:surum). Geçerlilik (hepsi gerekli, yoksa GERİ YÜKLEME YOK):
+#   biçim + sağlama tutar; SAAT_TABAN <= t (derleme anı: build.sh SOURCE_DATE_EPOCH/KBUILD_BUILD_TIMESTAMP 2026-11-20 00:00 UTC;
+#   imajın gömülü initramfs mtime'ı da bu) ; t <= SAAT_UST (taban + 10 yıl: makul olmayan gelecek); t > şimdiki saat (yalnız
+#   İLERİ alınır; systemd açılışta saati kendi derleme anına, 2026-04-27, çekiyor). Yazma: yalnız şimdiki saat [TABAN, UST]
+#   içindeyse (chrony ya da geri yükleme sonrası). Yerinde O_DIRECT + fdatasync (conv=notrunc): ilk yazma dosyayı oluşturur
+#   (blok bir kez ayrılır), sonrakiler aynı 4 KiB bloğun üstüne; lazytime + fdatasync -> yalnız zaman damgası değişen inode
+#   günlüğe yazılmaz (yazma = 8 sektör veri). KK_SAAT_* yalnız yerel sınama/QEMU içindir.
+SAAT=/kk/durum/saat; SAAT_TABAN=${KK_SAAT_TABAN:-1795132800}; SAAT_UST=$((SAAT_TABAN + 315360000)); SAAT_ARALIK=${KK_SAAT_ARALIK:-600}
+saat_sag() { printf %s "$1" | sha256sum | cut -c1-16; }
+saat_dosya() {	# saat dosyasını yalnız okur -> stdout "t:<t> <neden>" ya da durum (yok|bozuk:*|gecersiz:*)
+	[ -f "$MNT$SAAT" ] || { echo yok; return 0; }
+	l=$(dd if="$MNT$SAAT" bs=4096 count=1 iflag=direct 2>/dev/null | head -n 1 | sed 's/ *$//')
+	case "$l" in "KKSAAT 1 "*" sag="*) ;; "KKSAAT "*) echo bozuk:surum; return 0;; *) echo bozuk:bicim; return 0;; esac
+	g=${l% sag=*}; sg=${l##* sag=}
+	[ "$(saat_sag "$g")" = "$sg" ] || { echo bozuk:saglama; return 0; }
+	ts=$(alan "$g" t); case $ts in ''|*[!0-9]*) echo bozuk:t; return 0;; esac
+	[ "$ts" -ge "$SAAT_TABAN" ] || { echo "gecersiz:eski($ts)"; return 0; }
+	[ "$ts" -le "$SAAT_UST" ] || { echo "gecersiz:gelecek($ts)"; return 0; }
+	echo "t:$ts $(alan "$g" neden)"
+}
+# G57: journald dosya başlığı (systemd 252.39 src/libsystemd/sd-journal/journal-def.h:197-224): signature[8] "LPKSHHRH" ofset 0,
+#   ... head_entry_realtime 184, tail_entry_realtime 192 (le64, us), tail_entry_monotonic 200. İlk 208 B okunur (dd + od; yazma yok).
+JB_IMZA="76 80 75 83 72 72 82 72"	# L P K S H H R H
+jb_oku() {	# $1 journal dosyası -> stdout tail_entry_realtime (us); okunamaz/kısa/imza yanlış/[TABAN, UST] dışı -> rc 1, çıktı yok
+	set -- $(dd if="$1" bs=208 count=1 2>/dev/null | od -An -v -tu1)
+	[ $# = 208 ] || return 1
+	[ "$1 $2 $3 $4 $5 $6 $7 $8" = "$JB_IMZA" ] || return 1
+	shift 192
+	[ "$8" = 0 ] || return 1	# en üst bayt 0 değilse >= 2^56 us: sınır dışı (kabuk aritmetiği taşmaz)
+	v=0; for b in $7 $6 $5 $4 $3 $2 $1; do v=$((v * 256 + b)); done
+	[ "$v" -ge $((SAAT_TABAN * 1000000)) ] && [ "$v" -le $((SAAT_UST * 1000000)) ] || return 1
+	echo "$v"
+}
+saat_geri() {	# bagla (rw, bağlandıktan sonra, bind ve flush'tan önce) -> stdout durum; saat dosyasını ve journal başlıklarını yalnız okur
+	# G56: t kaydedilen saniyenin BAŞI (date +%s keser) -> saniyenin SONUNA kur (+1).
+	# G57: kapanışta saat dosyasından SONRA da günlüğe girdi düşebiliyor (tasarım G57) ve kirli kapanışta dosya eski kalır ->
+	#   b = max(dosya t, etkin başlıkların tail_entry_realtime saniyesi); kurulan saat b+1 > her etkin dosyanın son girdisi
+	#   (journal-file.c:516 "from the future" koşulu oluşmaz). Etkin = journal/*/system.journal, journal/*/user-*.journal; adında
+	#   @ olan (arşiv) ve ~ ile biten (bozuk sayılmış) dosyalar sayılmaz. Kurallar (taban/üst/yalnız ileri) b'ye aynen; +1 üste kırpılır.
+	sd=$(saat_dosya); ts=; ne=-
+	case $sd in t:*) ts=${sd%% *}; ts=${ts#t:}; ne=${sd#* }; sd=$ts;; esac
+	jm=0; jn=0; jg=0
+	for f in "$MNT"/journal/*/system.journal "$MNT"/journal/*/user-*.journal; do
+		[ -f "$f" ] && [ ! -L "$f" ] || continue
+		case ${f##*/} in *@*|*"~") continue;; esac
+		jn=$((jn + 1)); u=$(jb_oku "$f") || continue
+		jg=$((jg + 1)); [ "$u" -gt "$jm" ] && jm=$u
+	done
+	if [ $jg -gt 0 ]; then jb="$((jm / 1000000)).$(printf %06d $((jm % 1000000)))($jg/$jn)"; else jb="yok($jg/$jn)"; fi
+	[ -n "$ts" ] || [ $jg -gt 0 ] || { echo "$sd,baslik=$jb"; return 0; }
+	k=dosya; b=${ts:-0}; tb=$((jm / 1000000))
+	[ $jg -gt 0 ] && [ "$tb" -gt "$b" ] && { k=baslik; b=$tb; }
+	S="kaynak=$k,dosya=$sd,baslik=$jb"
+	tn=$(date +%s); [ "$b" -gt "$tn" ] || { echo "ileri-degil($b<=$tn,$S)"; return 0; }
+	tg=$((b + 1)); [ "$tg" -le "$SAAT_UST" ] || tg=$SAAT_UST
+	date -u -s "@$tg" > /dev/null 2>&1 || { echo "hata:date($tg,$S)"; return 0; }
+	echo "geri:$tg(+$((tg - tn))s,$ne,$S)"
+}
+saat_yaz() {	# $1 neden; yalnız rw (izle/kapat çağırır; L = rw loop) -> stdout durum
+	tn=$(date +%s); case $tn in ''|*[!0-9]*) echo atlandi:date; return 0;; esac
+	[ "$tn" -ge "$SAAT_TABAN" ] || { echo "atlandi:eski($tn)"; return 0; }
+	[ "$tn" -le "$SAAT_UST" ] || { echo "atlandi:gelecek($tn)"; return 0; }
+	g="KKSAAT 1 t=$tn boot=$BOOT up=$(up) neden=$1"
+	printf '%-4095s\n' "$g sag=$(saat_sag "$g")" > "$R/saat.yeni" || { echo YAZILAMADI:run; return 0; }
+	wa=$(lws "$L")
+	dd if="$R/saat.yeni" of="$MNT$SAAT" bs=4096 count=1 oflag=direct conv=notrunc,fdatasync 2>/dev/null || { echo YAZILAMADI; return 0; }
+	[ "$(dd if="$MNT$SAAT" bs=4096 count=1 iflag=direct 2>/dev/null | sha256sum)" = "$(sha256sum < "$R/saat.yeni")" ] || { echo GERI-OKUMA; return 0; }
+	echo "$(upi) t=$tn neden=$1 lw=$wa->$(lws "$L")" >> "$R/saat.gecmis"
+	echo "yazildi:$tn"
+}
+sayac_yaz() {	# yerinde O_DIRECT (ilk kez: oluşturur); geri okuma
+	sayac_kayit "$@" > "$R/sayac.yeni" || return 1
+	dd if="$R/sayac.yeni" of="$MNT$SAYAC" bs=4096 count=1 oflag=direct conv=notrunc,fsync 2>/dev/null || return 1
+	[ "$(dd if="$MNT$SAYAC" bs=4096 count=1 iflag=direct 2>/dev/null | sha256sum)" = "$(sha256sum < "$R/sayac.yeni")" ]
+}
+
+# ---------------------------------------------------------------- bagla
+ACILDI=0; MNTD=0; MNTB=0; LR=; LW=; BITTI=0; KIP=dur
+son() {
+	rc=$?
+	[ $BITTI = 1 ] && return
+	# sıra: bind -> iç fs -> bizim loop'larımız -> pencere (G50 E5 trap sırası)
+	[ $MNTB = 1 ] && { umount "$JD" 2>&1; say "trap: umount $JD rc=$?"; }
+	[ $MNTD = 1 ] && { umount "$MNT" 2>&1; say "trap: umount $MNT rc=$?"; }
+	for x in $LW $LR; do losetup -d "$x" 2>&1; say "trap: losetup -d $x rc=$?"; done
+	[ $ACILDI = 1 ] && { echo kapat > "$KY" 2>/dev/null; say "trap: kapat; kk_yazma: $(cat "$KY" 2>&1)"; }
+	rm -f "$R/izle" "$R/loop"
+	[ -s "$R/durum" ] || durum_yaz "kip=dur neden=rc$rc"
+	ilan "SONUC $(cut -d' ' -f1-2 "$R/durum") rc=$rc pencere=$(cut -d' ' -f1 "$KY" 2>/dev/null)"
+}
+dur() { durum_yaz "kip=$KIP neden=$(echo "$*" | tr ' ' '_' | cut -c1-120)"; ilan "DUR: $*"; exit 3; }
+bagla() {
+	trap son EXIT; trap 'exit 4' INT TERM HUP
+	rm -f "$R/durum" "$R/izle" "$R/loop" "$R/izle.gecmis" "$R/saat.son" "$R/saat.gecmis" "$R/saat.yeni" "$R/kova"
+	K=$(kip_oku)
+	if [ "$K" = 0 ]; then durum_yaz "kip=yok neden=cmdline"; say "kk_alan yok: islem yok"; BITTI=1; exit 0; fi
+	ilan "BASLADI istek=$K boot=$BOOT up=$(up) W=[$W_BAS, $W_SON)"
+	case "$(uname -r)" in 6.12.*-kk-g*) ;; *) [ -n "${KK_SINAMA:-}" ] || dur "uname ana hat degil";; esac
+	for t in losetup e2fsck dumpe2fs debugfs mount umount findmnt dd sha256sum awk od filefrag lsattr journalctl blockdev; do
+		command -v $t > /dev/null || dur "arac yok: $t"; done
+	losetup --help 2>&1 | grep -q -- '--direct-io' || dur "losetup --direct-io yok"
+	# B1-B3: pencere, DT, GPT, disk (kk-anahat-pencere denetle'nin aynısı)
+	esit kk_yazma "$(cat "$KY" 2>&1)" "durum=hazir bas=$W_BAS son=$W_SON neden=-"
+	esit dt-aralik "$(q yazma-araligi)" "$W_BAS $W_SAY"
+	esit dt-bolum "$(r yazma-bolum) $(q yazma-bolum-no) $(q yazma-bolum-araligi)" "userdata $NO $UD_BAS $UD_BOY"
+	esit dt-uuid-kart "$(r yazma-partuuid) $(q kart-sektor)" "$PUUID $KART"
+	esit gpt "$(cat $P/start) $(cat $P/size) $(cat $P/partition) $(sed -n 's/^PARTNAME=//p' $P/uevent)" "$UD_BAS $UD_BOY $NO userdata"
+	esit kapasite-ro "$(cat $SYS/block/$DSK/size) $(cat $SYS/block/$DSK/ro)" "$KART 1"
+	esit stat-yazma "$(st)" "0 0 0 0"	# açılıştan beri eMMC'ye yazma/discard/flush yok
+	esit a12 "$(a12 kapi) $(a12 red)" "etkin 0"	# G53: A12 (bdev yazma girişi kapısı) ön koşul; açılıştan beri red yok
+	[ -z "$(lp)" ] || dur "p68'e ya da diske bagli loop zaten var: $(lp | tr '\n' ' ')"
+	findmnt -rn "$MNT" > /dev/null && dur "$MNT zaten bagli"
+	# B4-B5: kkdata ve alan.img'in yeri (QEMU'da DOSYA=0: kkdata'da pencereye eşlenen dosya yok)
+	if [ "$DOSYA" = 1 ]; then
+		esit kkdata "$(findmnt -rn -o SOURCE,FSTYPE "$KKD")" "$DEV/$PRT ext4"
+		case ",$(findmnt -rn -o OPTIONS "$KKD")," in *,ro,*) say "ok kkdata ro";; *) dur "kkdata ro bagli degil";; esac
+		dumpe2fs -h "$DEV/$PRT" 2>/dev/null | grep -q '^Filesystem features:.*needs_recovery' && dur "kkdata needs_recovery"
+		[ -e "$KKD/kk/state/anahat-alan-bozuk" ] && dur "anahat-alan-bozuk isareti var"
+		esit alan-boy "$(stat -c %s "$ALAN")" "$IBOY"
+		case "$(lsattr -d "$ALAN" | cut -d' ' -f1)" in *i*) say "ok alan immutable";; *) dur "alan.img immutable degil";; esac
+		filefrag -v -e "$ALAN" > "$R/fiemap.txt" 2>&1
+		esit fiemap "$(awk '/^ *[0-9]+:/{s=$0;gsub(/\.\./," ",s);gsub(/:/," ",s);split(s,x," ");if(!e){i=x[4];if(x[2]!=0)b=1}else if(x[2]!=l+1||x[4]!=p+1)b=1;if(s~/unwritten/)u++;l=x[3];p=x[5];T+=x[6];e++}END{printf "ilk=%s top=%d uw=%d kes=%d\n",i,T,u,b}' "$R/fiemap.txt")" "ilk=$PB top=262144 uw=0 kes=0"
+	fi
+	# B6: sınır bekçileri (pencerenin önü/arkası 1'er MiB, O_DIRECT); kapanışta aynı olmalı
+	sinir > "$R/sinir-once"; say "sinir once: $(cat "$R/sinir-once")"
+	# B7: iç fs SALT OKUNUR loop'tan: kimlik, kirli durum, sayaç (debugfs -c: bitmap okumaz, yazmaz)
+	LR=$(losetup -r --direct-io=on -o $DOFS --sizelimit $IBOY -f --show "$DEV/$DSK" 2>&1); say "ro loop: '$LR'"
+	case $LR in "$DEV"/loop[0-9]*) ;; *) LR=; dur "ro loop kurulamadi";; esac
+	lo_bak ro-loop "$LR" 1
+	IH=$(dh "$LR"); say "ic fs once: $IH"
+	esit ic-kimlik "$(alan "${IH%%|*}" ad) $(alan "${IH%%|*}" uuid)" "$IAD $IUUID"
+	esit ic-ozellik "${IH#*|}" "$OZ"
+	NR=$(alan "${IH%%|*}" kurtarma); IST=$(echo "${IH%%|*}" | sed -n 's/.*durum=\(.*\) kurtarma=.*/\1/p')
+	SK=$(debugfs -c -R "cat $SAYAC" "$LR" 2>/dev/null | head -n 1 | tr -d '\000' | sed 's/ *$//')
+	say "sayac once: '${SK:-YOK}'"
+	if [ -z "$SK" ]; then N0=0; D0=0; SD=YOK; B0=0; KT0=0
+	else
+		case "$SK" in "KKSAYAC 1 "*) ;; *) SK=BOZUK;; esac
+		N0=$(alan "$SK" kirli); D0=$(alan "$SK" duz); SD=$(alan "$SK" durum); B0=$(alan "$SK" bag); KT0=$(alan "$SK" kirli_top)
+		for v in "$N0" "$D0" "$B0" "$KT0"; do case $v in ''|*[!0-9]*) SK=BOZUK;; esac; done
+		[ "$SK" = BOZUK ] && { N0=0; D0=0; B0=0; KT0=0; SD=BOZUK; }
+	fi
+	KB=0; KN=
+	[ "$NR" = 1 ] && { KB=1; KN="${KN}needs_recovery,"; }
+	[ "$SD" = ACIK ] && { KB=1; KN="${KN}sayac_ACIK,"; }
+	case "$IST" in clean) ;; *) KN="${KN}durum_$(echo "$IST" | tr ' ' '_'),";; esac
+	N=$(( KB ? N0 + 1 : 0 )); KT=$((KT0 + KB))
+	say "onceki kapanis: $([ $KB = 1 ] && echo KIRLI || echo temiz) (${KN:-temiz}) kirli_ardisik=$N duzeltme_ardisik=$D0"
+	KIP=rw; NEDEN=-
+	[ "$K" = ro ] && { KIP=ro; NEDEN=cmdline; }
+	[ "$SD" = BOZUK ] && { KIP=ro; NEDEN=sayac-okunamadi; }
+	[ $N -ge $KIRLI_SINIR ] && { KIP=ro; NEDEN="SAYAC-DUR:kirli=$N"; }
+	[ "$D0" -ge $DUZ_SINIR ] && { KIP=ro; NEDEN="SAYAC-DUR:duz=$D0"; }
+	if [ $KIP = ro ]; then
+		# inceleme: pencere AÇILMAZ; ro loop + ro,noload (günlük oynatılmaz); journald /run'da kalır
+		mkdir -p "$MNT"; MNTD=1
+		mount -t ext4 -o ro,noload,nodiscard "$LR" "$MNT" 2>&1 || { MNTD=0; say "ro baglama basarisiz (rc $?)"; }
+		echo "$LR" > "$R/loop"
+		durum_yaz "kip=ro neden=$NEDEN loop=$LR kirli=$N duz=$D0 bagli=$MNTD"
+		ilan "RO neden=$NEDEN kirli_ardisik=$N duz_ardisik=$D0 sayac='$(echo "$SK" | cut -c1-90)' pencere=$(cut -d' ' -f1 "$KY")"
+		BITTI=1; exit 0
+	fi
+	losetup -d "$LR" 2>&1 || dur "ro loop silinemedi"; LR=
+	[ -z "$(lp)" ] || dur "ro loop silindikten sonra p68'de ya da diskte loop var"
+	# B7b (G53 A12-1): p68 bölüm bayrağı ro (BLKROSET; çekirdek bellek bayrağı, aygıta yazma yok), pencere AÇILMADAN önce.
+	# set_disk_ro(0) bölüm bayrağını silmez -> pencere açıkken kkdata (p68) ro kalır; yalnız tüm disk (mmcblk0) yazılabilir.
+	blockdev --setro "$DEV/$PRT" 2>&1 || dur "p68 setro basarisiz"
+	esit p68-ro-bayrak "$(blockdev --getro "$DEV/$PRT" 2>&1)" 1
+	# B8-B10: pencere -> rw loop (O_DIRECT zorunlu: tamponlu loop pencere dışı yazmayı gizler)
+	ACILDI=1; echo ac > "$KY" || dur "ac yazilamadi"
+	esit durum-acik "$(cat "$KY")" "durum=acik bas=$W_BAS son=$W_SON neden=-"
+	esit ro-acik "disk=$(cat $SYS/block/$DSK/ro) p68=$(cat $P/ro)" "disk=0 p68=1"
+	LW=$(losetup --direct-io=on -o $DOFS --sizelimit $IBOY -f --show "$DEV/$DSK" 2>&1); say "rw loop: '$LW'"
+	case $LW in "$DEV"/loop[0-9]*) ;; *) LW=; dur "rw loop kurulamadi";; esac
+	lo_bak rw-loop "$LW" 0
+	# B11: e2fsck yalnız -p (önceki kapanış kirliyse ya da durum temiz değilse -f -p); -y ASLA
+	printf '[options]\n\tbroken_system_clock = 1\n' > "$R/e2fsck.conf"
+	EF=-p; [ $KB = 1 ] || [ "$IST" != clean ] && EF="-f -p"
+	t0=$(up); E2FSCK_CONFIG=$R/e2fsck.conf e2fsck $EF "$LW" > "$R/e2fsck.txt" 2>&1; er=$?; t1=$(up)
+	say "e2fsck $EF rc=$er ($(awk -v a=$t0 -v b=$t1 'BEGIN{printf "%.1f", b-a}') sn): $(tr '\n' '|' < "$R/e2fsck.txt" | cut -c1-300)"
+	D=$D0
+	case $er in
+	0) D=0;;
+	1) [ $KB = 1 ] && D=0 || D=$((D0 + 1));;	# kirli kapanış sonrası düzeltme beklenen; açıklanamayan düzeltme sayılır
+	*) KIP=bozuk; dur "BOZUK e2fsck rc=$er (baglanmadi; onarim yalniz onayli oturumda)";;
+	esac
+	# B12: bağlama (-w: ro'ya sessiz düşme yok)
+	mkdir -p "$MNT"; MNTD=1
+	CO=commit=30; [ "$(az_oku)" = 1 ] && CO=commit=300,lazytime	# G53 yazma azaltma (yalnız kk_alan_az=1)
+	mount -w -t ext4 -o rw,noatime,nodiscard,data=ordered,errors=remount-ro,$CO,noinit_itable "$LW" "$MNT" 2>&1 || dur "mount basarisiz"
+	mo=$(findmnt -rn -o SOURCE,FSTYPE,OPTIONS "$MNT"); say "bagli: $mo"
+	case "$mo" in "$LW ext4 rw,"*errors=remount-ro*) ;; *) dur "baglama beklenen degil: '$mo'";; esac
+	case "$mo" in *discard*) case "$mo" in *nodiscard*) ;; *) dur "discard acik";; esac;; esac
+	# B13: dizinler + sayaç (durum=ACIK; temiz kapanışta KAPALI)
+	mkdir -p "$MNT/journal" "$MNT/kk/durum" || dur "dizin olusturulamadi"
+	sayac_yaz $N $D ACIK $((B0 + 1)) $KT "${KN:-temiz}" || dur "sayac yazilamadi"
+	say "sayac: $(head -n 1 "$R/sayac.yeni" | sed 's/ *$//')"
+	# B13b (G55 SAAT): geri yükleme. Burada (bagla içinde) olması flush'tan önce olmasını garanti eder (birim sırası, üstte).
+	SG=$(saat_geri); say "saat: $SG (simdi $(date -u +%FT%TZ))"; echo "$(upi)" > "$R/saat.son"
+	# B14: yalnız /var/log/journal kalıcı (bind); 4.9'un alt katmandaki günlüğü bind altında gizli kalır
+	mkdir -p "$JD"; MNTB=1
+	mount --bind "$MNT/journal" "$JD" 2>&1 || dur "bind basarisiz"
+	esit bind "$(findmnt -rn -o SOURCE,TARGET "$JD" | sed 's/\[.*\]//' | awk '{print $2}')" "$JD"
+	echo "$LW" > "$R/loop"; echo "$(upi) 0" > "$R/izle.gecmis"; : > "$R/izle"
+	[ "$KOVA" = 1 ] && echo "$(upi) 0 $KOVA_U" > "$R/kova"	# G58: kova dolu; bağlamadan beri bütün loop yazması düşülecek (lw_once 0)
+	durum_yaz "kip=rw neden=- loop=$LW kirli=$N duz=$D e2fsck=$er"
+	if [ "$KOVA" = 1 ]; then BU=" kova=$(kova_yaz)"; elif [ "$(az_oku)" = 1 ]; then BU=" butce=$BUTCE_OTURUM"; else BU=; fi
+	ilan "BAGLANDI kip=rw loop=$LW e2fsck=$er ($EF) kirli_ardisik=$N onceki=${KN:-temiz} bag=$((B0 + 1)) w_sec=$(lws "$LW") $CO p68_ro=$(cat $P/ro) a12_red=$(a12 red)$BU saat=$SG"
+	BITTI=1; exit 0
+}
+
+# ---------------------------------------------------------------- kapat
+kapat() {	# $1 = neden (temiz|BUTCE|YABANCI-YAZMA|DISCARD|REMOUNT-RO|DOLU|RED)
+	NE=${1:-temiz}
+	if [ ! -f "$R/loop" ]; then
+		# bağlı değil: yine de pencere kilitlenir (hazir/acik -> kilitli)
+		case "$(cut -d' ' -f1 "$KY" 2>/dev/null)" in durum=hazir|durum=acik) echo kapat > "$KY" 2>/dev/null;; esac
+		say "kapat ($NE): bagli degil; $(cat "$R/durum" 2>/dev/null | cut -c1-120); kk_yazma: $(cut -d' ' -f1 "$KY" 2>/dev/null)"
+		return 0
+	fi
+	L=$(cat "$R/loop"); K0=$(alan "$(cat "$R/durum")" kip); rm -f "$R/izle"
+	J=ok; U=ok; LD=ok; S=-; SN=-; SY=-
+	if [ "$K0" = rw ]; then
+		if findmnt -rn "$JD" > /dev/null; then
+			journalctl --relinquish-var > /dev/null 2>&1 || J="relinquish-rc$?"
+		fi
+		# G55 SAAT: kapanış güncellemesi (journald bıraktıktan sonra -> saat >= son günlük girdisi); iç fs hatasında yazılmaz
+		[ "$NE" = REMOUNT-RO ] && SY=atlandi:remount-ro || SY=$(saat_yaz "kapat:$NE")
+		SK=$(head -n 1 "$MNT$SAYAC" 2>/dev/null | sed 's/ *$//')
+		sayac_yaz 0 "$(alan "$SK" duz)" KAPALI "$(alan "$SK" bag)" "$(alan "$SK" kirli_top)" "$NE" && S=KAPALI || S=YAZILAMADI
+		sync -f "$MNT" 2>/dev/null
+		i=0; while findmnt -rn "$JD" > /dev/null && [ $i -lt 5 ]; do umount "$JD" 2>/dev/null || sleep 1; i=$((i + 1)); done
+		findmnt -rn "$JD" > /dev/null && U=bind-mesgul
+	fi
+	i=0; while findmnt -rn "$MNT" > /dev/null && [ $i -lt 5 ]; do umount "$MNT" 2>/dev/null || sleep 1; i=$((i + 1)); done
+	if findmnt -rn "$MNT" > /dev/null; then
+		if mount -o remount,ro "$MNT" 2>/dev/null; then U="KAPANIS-RO"
+		else U="UMOUNT-HATA"; [ "$K0" = rw ] && { SK=$(head -n 1 "$MNT$SAYAC" 2>/dev/null); sayac_yaz "$(alan "$SK" kirli)" "$(alan "$SK" duz)" ACIK "$(alan "$SK" bag)" "$(alan "$SK" kirli_top)" umount-hata; S=ACIK; }
+		fi
+	fi
+	[ "$U" = ok ] && { losetup -d "$L" 2>/dev/null || LD="rc$?"; } || LD=atlandi
+	[ -n "$(lp)" ] && LD="$LD,kalan:$(lp | tr '\n' ' ')"
+	echo kapat > "$KY" 2>/dev/null
+	PD=$(cut -d' ' -f1 "$KY" 2>/dev/null)
+	[ -f "$R/sinir-once" ] && { [ "$(sinir)" = "$(cat "$R/sinir-once")" ] && SN=ayni || SN=FARK; }
+	rm -f "$R/loop"
+	durum_yaz "kip=kapali neden=$NE onceki_kip=$K0"
+	if [ "$K0" = rw ] && [ $U = ok ] && [ $LD = ok ] && [ $S = KAPALI ] && [ $PD = durum=kilitli ] && [ $SN = ayni ]; then T=temiz; else T=SORUNLU; fi
+	[ "$K0" = ro ] && [ $U = ok ] && [ $LD = ok ] && [ $PD = durum=kilitli ] && T=temiz
+	ilan "KAPANDI $T (neden=$NE kip=$K0 journald=$J umount=$U loop=$LD sayac=$S pencere=${PD#durum=} sinir=$SN w_sec=$(st | cut -d' ' -f2) discard=$(st | cut -d' ' -f3) a12_red=$(a12 red) saat=$SY)"
+}
+
+# ---------------------------------------------------------------- acil reboot (G52 QEMU q-disari bulgusu)
+# Pencere açıkken pencere DIŞINA ham yazma diskte reddedilir ama blok aygıtının sayfa önbelleğini zehirler: kkdata'nın
+# (Debian alt katmanı) bellekteki süper bloğu/blokları bozulur, loop'un O_DIRECT yazmaları EIO alır, systemctl reboot
+# birim dosyasını okuyamayıp reddeder. Disk sağlamdır; bellek değildir -> oturum sürdürülmez: alan kapatılır, reboot.
+# systemctl başarısızsa statik kk-reboot2 (sync + RESTART2 bootloader; alt katmana bağlı değil).
+acil() {
+	ilan "ACIL REBOOT neden=$1 (yabanci yazma/red/discard: blok aygiti sayfa onbellegi guvenilmez)"
+	systemctl reboot bootloader && exit 0
+	ilan "ACIL: systemctl reboot basarisiz (rc=$?); kk-reboot2 bootloader"
+	exec /usr/local/sbin/kk-reboot2 bootloader
+}
+
+# ---------------------------------------------------------------- izle
+izle() {
+	[ -f "$R/izle" ] && [ -f "$R/loop" ] || exit 0
+	L=$(cat "$R/loop"); t=$(upi)
+	# sıra: önce yabancı yazma izleri (acil reboot), sonra iç fs hatası (yalnız kapat), sonra bütçe/doluluk (G52 QEMU q-disari 3. koşu)
+	# kapsam: eMMC'ye yazan yalnız bu loop olmalı (sayım tamamlanmada; uçuştaki istek için 3 deneme)
+	i=0; while [ $i -lt 3 ]; do a=$(lws "$L"); m=$(st | cut -d' ' -f2); [ "$a" = "$m" ] && break; sleep 1; i=$((i + 1)); done
+	[ "$a" = "$m" ] || { uyar "izle: kapsam farki loop=$a mmc=$m"; kapat YABANCI-YAZMA; acil YABANCI-YAZMA; }
+	[ "$(st | cut -d' ' -f3)" = 0 ] || { uyar "izle: discard_io $(st | cut -d' ' -f3)"; kapat DISCARD; acil DISCARD; }
+	# G53: A12 kapısı pencere dışı ham yazmayı önbelleğe girmeden reddeder (zehirlenme yok); yine de girişim = işletim kuralı
+	# ihlali ya da hata -> oturum sürdürülmez (tasarım G53). Sayaç okunamazsa da aynı (kapı yoksa bagla zaten DUR der).
+	ar=$(a12 red); [ "$ar" = 0 ] || { uyar "izle: A12 red=${ar:-OKUNAMADI} ($(cat "$KA" 2>&1 | cut -c1-120))"; kapat A12-RED; acil A12-RED; }
+	rd=$(dmesg | grep -v 'kk: dmesg:' | grep -c 'kk: blok yazma reddedildi'); [ "$rd" = 0 ] || { uyar "izle: blok red $rd"; kapat RED; acil RED; }
+	# errors=remount-ro: 6.12 ext4 hata sonrası SB_RDONLY koymuyor (iç "acil ro"); findmnt OPTIONS ve FS-OPTIONS "rw" kalıyor
+	# (G52 QEMU q-hata iki koşu) -> çekirdeğin kendi satırına bakılır; ayrıca süper blok gerçekten ro'ya alınmışsa
+	ln=${L##*/}; eh=$(dmesg | grep -v 'kk: dmesg:' | grep -cE "EXT4-fs error \(device $ln\)|EXT4-fs \($ln\): Remounting filesystem read-only")
+	case ",$(findmnt -rn -o FS-OPTIONS "$MNT")," in *,rw,*) ;; *) eh=$((eh + 1));; esac
+	[ "$eh" = 0 ] || { uyar "izle: ic fs hatasi ($eh satir; errors=remount-ro)"; kapat REMOUNT-RO; exit 0; }
+	lw=$(lws "$L"); echo "$t $lw" >> "$R/izle.gecmis"
+	d10=$(awk -v t=$t -v w=$lw '$1 >= t - 600 {print w - $2; exit}' "$R/izle.gecmis")
+	if [ "$KOVA" = 1 ]; then	# G58 günlük kip: kova (oturum bütçesi yok)
+		kova_adim "$t" "$lw"
+		[ "$KS" -lt $((KOVA_PAY * 3600)) ] && { uyar "izle: kova $((KS / 3600)) sektor < pay $KOVA_PAY ($(kova_yaz); w_sec=$lw durum=$KD up=$t)"; kapat BUTCE; exit 0; }
+	else
+	[ "$lw" -gt "$BUTCE_OTURUM" ] && { uyar "izle: oturum yazmasi $lw sektor > $BUTCE_OTURUM"; kapat BUTCE; exit 0; }
+	fi
+	[ "${d10:-0}" -gt "$BUTCE_10DK" ] && { uyar "izle: 10 dk yazmasi $d10 sektor > $BUTCE_10DK"; kapat BUTCE; exit 0; }
+	ku=$(df -k "$MNT" | awk 'NR==2{print $3}'); [ "${ku:-0}" -gt "$DOLU_KIB" ] && { uyar "izle: kullanilan $ku KiB"; kapat DOLU; exit 0; }
+	# kk_alan_az=1: olağan "izle ok" satırı günlüğe yazılmaz (LogLevelMax kısa ömürlü birimin stdout'unda her zaman tutmuyor; G53 QEMU duman)
+	# G55 SAAT: en çok 10 dk'da bir (son yazma/bağlamadan >= SAAT_ARALIK sn); yalnız buraya kadar gelen (rw, sağlıklı) izle
+	SY=-; s0=$(cat "$R/saat.son" 2>/dev/null); case $s0 in ''|*[!0-9]*) s0=0;; esac
+	if [ $((t - s0)) -ge "$SAAT_ARALIK" ]; then
+		SY=$(saat_yaz izle); echo "$t" > "$R/saat.son"
+		case $SY in yazildi:*|atlandi:*) ;; *) uyar "izle: saat $SY";; esac
+	fi
+	o="izle ok: w_sec=$lw 10dk=${d10:-0} mmc=$m kullanilan=${ku}KiB saat=$SY$([ "$KOVA" = 1 ] && echo " kova=$((KS / 3600))($KD)") up=$t"; [ "$(az_oku)" = 1 ] && echo "$o" > "$R/izle.son" || say "$o"
+}
+
+durum() {
+	echo "durum: $(cat "$R/durum" 2>/dev/null || echo YOK)"
+	echo "kk_yazma: $(cat "$KY" 2>&1)"
+	echo "baglama: $(findmnt -rn -o SOURCE,TARGET,OPTIONS "$MNT" 2>/dev/null | tr '\n' ';') bind: $(findmnt -rn -o TARGET "$JD" 2>/dev/null)"
+	[ -f "$R/loop" ] && { L=$(cat "$R/loop"); y=$SYS/block/${L##*/}; echo "loop: $L ro=$(cat $y/ro) dio=$(cat $y/loop/dio) ofs=$(cat $y/loop/offset) boy=$(cat $y/loop/sizelimit) w_sec=$(lws "$L")"; }
+	echo "sayac: $(head -n 1 "$MNT$SAYAC" 2>/dev/null | sed 's/ *$//')"
+	echo "saat: $(head -n 1 "$MNT$SAAT" 2>/dev/null | sed 's/ *$//' | cut -c1-140); simdi $(date -u +%FT%TZ); gecmis: $(tr '\n' ';' < "$R/saat.gecmis" 2>/dev/null)"
+	echo "mmc stat (yazma_io yazma_sektor discard_io flush_io): $(st)"
+	if [ "$KOVA" = 1 ]; then set -- $(cat "$R/kova" 2>/dev/null)	# G58: yalnız okur (son izle turundaki seviye; yeni yazma düşülmemiş)
+		[ $# = 3 ] && echo "kova: seviye=$(($3 / 3600)) sektor (izle up=$1 lw=$2; pay $KOVA_PAY; $(kova_yaz)) simdi up=$(upi)" || echo "kova: durum yok ($(kova_yaz))"
+	else echo "kova: yok (kk_gunluk yok; butce_oturum=$BUTCE_OTURUM)"; fi
+	echo "kk_a12: $(cat "$KA" 2>&1); p68 ro=$(cat $P/ro 2>&1) disk ro=$(cat $SYS/block/$DSK/ro 2>&1)"
+}
+
+case $MOD in
+bagla) bagla;;
+kapat) kapat "${2:-temiz}";;
+izle) izle;;
+durum) durum;;
+esac
+exit 0

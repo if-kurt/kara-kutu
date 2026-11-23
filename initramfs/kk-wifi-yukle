@@ -1,0 +1,112 @@
+#!/bin/sh
+# Kara Kutu G59-C: Wi-Fi tetik zinciri (ana hat Debian'da, kk-wifi-yukle.service). Yalniz kernel cmdline'da kk_wifi.ac=1 ise calisir
+# (init yalniz o zaman birimi yazar). Acilis basina TEK tetik (yeniden yukleme YOK). Her hata = exit 0 + durum dosyasi + kmsg.
+# PSK/SSID/BSSID HICBIR yere yazilmaz: 4.9 dosyasi yalniz sayim/izin icin okunur (grep -c, stat), icerigi basilmaz.
+# Kullanim: kk-wifi-yukle            (tetik zinciri)
+#           kk-wifi-yukle ek-yaz <yol>   (yalniz ek.conf uretir; yerel sinama)
+# Yazma yeri: /run/kk-wifi (0700), /dev/kmsg. Sistem dosyasi yazilmaz; sysfs'e yalniz iki 'baslat' tetigi.
+umask 077
+RUN=${KK_WIFI_RUN:-/run/kk-wifi}
+CONF=${KK_WIFI_4X:-/etc/wpa_supplicant/wpa_supplicant-wlan0.conf}
+KAPI=${KK_WIFI_KAPI:-/sys/bus/platform/devices/fff35000.sdio-kapi}
+KW=${KK_WIFI_KW:-/sys/kernel/kk_wifi}
+M3B=${KK_WIFI_M3B:-/sys/kernel/kk_m3b}
+KMSG=${KK_WIFI_KMSG:-/dev/kmsg}
+UPF=${KK_WIFI_UPTIME:-/proc/uptime}
+EK=$RUN/ek.conf
+DURUM=$RUN/yukle-durum
+
+upi() { cut -d. -f1 "$UPF"; }
+kmsg() { echo "<$1>kk-wifi: $2" >> "$KMSG" 2>/dev/null; return 0; }
+# ek.conf: PSK'siz, SSID'siz, ag blogu YOK (ag/PSK 4.9 dosyasinda, -c ile okunur)
+ek_yaz() {
+	( umask 077
+	printf '%s\n' "ctrl_interface=$RUN" "update_config=0" "p2p_disabled=1" "country=TR" "passive_scan=1" "ap_scan=1" "pmf=0" \
+		"freq_list=2412 2417 2422 2427 2432 2437 2442 2447 2452 2457 2462 2467 2472" > "$1" ) || return 1
+	chmod 600 "$1"
+}
+if [ "${1:-}" = ek-yaz ]; then ek_yaz "${2:?yol}"; exit $?; fi
+
+mkdir -p "$RUN" && chmod 700 "$RUN" || exit 0
+# test carpani (yalniz QEMU: kernel zaman asimlari x20): /run/kk-wifi/yukle-test.conf, yalniz CARPAN=1..20, ILK_SN=0..60; source EDILMEZ
+CARPAN=1; ILK=60; KSAHTE=0
+TC=$RUN/yukle-test.conf
+if [ -f "$TC" ]; then
+	v=$(grep -x 'CARPAN=[0-9]*' "$TC" | tail -n 1 | cut -d= -f2); case $v in ''|*[!0-9]*) ;; *) [ ${#v} -le 2 ] && [ "$v" -ge 1 ] && [ "$v" -le 20 ] && CARPAN=$v;; esac
+	v=$(grep -x 'ILK_SN=[0-9]*' "$TC" | tail -n 1 | cut -d= -f2); case $v in ''|*[!0-9]*) ;; *) [ ${#v} -le 2 ] && [ "$v" -le 60 ] && ILK=$v;; esac
+	grep -qx 'KART_SAHTE=1' "$TC" && KSAHTE=1	# G59-K yalniz QEMU: sahte kapida mmc karti yok (kart GORULMEDI beklenir)
+fi
+yok() {	# $1 = asama/neden; hata = exit 0, durum dosyasi, kmsg
+	echo "WIFI-YOK($1) up=$(upi)" > "$DURUM"; kmsg 4 "WIFI-YOK($1) (tetik tekrarlanmaz; bu acilista kalici; bekci/reboot = care) up=$(upi)"; exit 0
+}
+echo "basladi up=$(upi)" > "$DURUM"
+kmsg 5 "yukle: basladi carpan=$CARPAN ilk=${ILK}s up=$(upi)"
+sleep "$ILK"	# USB/SSH ve sigorta/pil ilk yoklamasi yerlessin (kurtarma erisimi hep once)
+
+# --- 2. 4.9 dosyasi denetimi (icerik basilmaz) ---
+[ -f "$CONF" ] && [ -r "$CONF" ] || yok "dosya-yok"
+[ "$(stat -c '%a %U' "$CONF" 2>/dev/null)" = "600 root" ] || yok "dosya-izin"
+[ "$(grep -c '^[[:space:]]*network=' "$CONF" 2>/dev/null)" = 1 ] || yok "dosya-ag-sayisi"
+[ "$(grep -c '^[[:space:]]*p2p_disabled=1' "$CONF" 2>/dev/null)" -ge 1 ] 2>/dev/null || yok "dosya-p2p"
+
+# --- 3. F1: SDIO kapi tetigi (tek) ---
+grep -q 'acilis=tamam' "$KAPI/durum" 2>/dev/null || yok "kapi-acilis"
+echo 1 > "$KAPI/baslat" 2>/dev/null || yok "kapi-tetik"
+n=0; lim=$((120 * CARPAN / 2)); ok=0
+while [ $n -lt $lim ]; do
+	d=$(cat "$KAPI/durum" 2>/dev/null)
+	case $d in *"sonuc='HAZIR"*) ok=1; break;; *"sonuc='DUR"*) yok "kapi-DUR";; esac
+	sleep 2; n=$((n + 1))
+done
+[ $ok = 1 ] || yok "kapi-zamanasimi"
+case $(cat "$KAPI/durum" 2>/dev/null) in *"kart='-'"*|"") yok "kapi-kart-yok";; esac
+echo "F1 tamam up=$(upi)" > "$DURUM"; kmsg 5 "yukle: F1 tamam (dwmmc2 + kart) up=$(upi)"
+
+# --- 3b. (G59-K) kart denetimi BITMEDEN Y1 tetigi verilmez. Y1 'baslat' kk-hi1102 sdio surucusunu kaydeder; kart bu sirada henuz taranmamissa
+# surucu karti hemen baglar ve kk-sdio-kapi (G48) 'fonksiyon surucusu BAGLI (BEKLENMEYEN)' diye karti yukleyiciye VERMEZ (A0 DUR; G59 cihaz
+# denemesi 1). M3c'de tetik karti GORULDU'den SONRA verilirdi. Durum 'sonuc=HAZIR' kart taramasindan ONCE yazilir: kart= alanina bakilir. ---
+n=0; lim=$((40 * CARPAN)); ok=0
+while [ $n -lt $lim ]; do
+	d=$(cat "$KAPI/durum" 2>/dev/null)
+	case $d in
+	*"kart='GORULDU"*"BEKLENEN;"*"surucu 0;"*) ok=1; break;;
+	*"kart='GORULDU"*) yok "kart-beklenmeyen";;
+	*"kart='GORULMEDI"*) [ "$KSAHTE" = 1 ] && { ok=1; break; }; yok "kart-yok";;
+	esac
+	sleep 1; n=$((n + 1))
+done
+[ $ok = 1 ] || yok "kart-zamanasimi"
+echo "kart tamam up=$(upi)" > "$DURUM"; kmsg 5 "yukle: kart denetimi bitti (fn1'de surucu yok; Y1 tetigi simdi) up=$(upi)"
+
+# --- 4. Y1: Hi1102 yukleyici (M3a firmware, ~30 sn) -> M3b otomatik HAZIR (tavan 300 sn) ---
+echo 1 > "$KW/baslat" 2>/dev/null || yok "yukleyici-tetik"
+n=0; lim=$((300 * CARPAN / 3)); ok=0
+while [ $n -lt $lim ]; do
+	d=$(cat "$M3B/durum" 2>/dev/null)
+	case $d in *"asama=HAZIR "*) ok=1; break;; *"asama=DUR "*) yok "m3b-DUR";; esac
+	case $d in *" dur=1 "*) yok "m3b-dur";; esac
+	sleep 3; n=$((n + 1))
+done
+[ $ok = 1 ] || yok "m3b-zamanasimi"
+echo "M3b HAZIR up=$(upi)" > "$DURUM"; kmsg 5 "yukle: M3b HAZIR up=$(upi)"
+
+# --- 5. wlan0 yukari, ek.conf, wpa_supplicant, networkd ---
+n=0; while [ $n -lt 30 ]; do [ -e /sys/class/net/wlan0 ] && break; sleep 1; n=$((n + 1)); done
+[ -e /sys/class/net/wlan0 ] || yok "wlan0-yok"
+timeout -k 2 10 ip link set wlan0 up || yok "wlan0-up"
+ek_yaz "$EK" || yok "ek-conf"
+timeout -k 2 20 systemctl start kk-wpa.service || yok "wpa-baslamadi"
+timeout -k 2 20 networkctl reload >/dev/null 2>&1
+
+# --- 6. <= 90 sn: COMPLETED + IPv4 adresi + varsayilan rota ---
+n=0; lim=$((90 * CARPAN / 3)); ok=0
+while [ $n -lt $lim ]; do
+	if timeout -k 2 8 wpa_cli -p "$RUN" -i wlan0 status 2>/dev/null | grep -q '^wpa_state=COMPLETED' \
+	   && [ -n "$(timeout -k 2 5 ip -4 -o addr show dev wlan0 2>/dev/null | grep ' inet ')" ] \
+	   && [ -n "$(timeout -k 2 5 ip -4 route show default dev wlan0 2>/dev/null)" ]; then ok=1; break; fi
+	sleep 3; n=$((n + 1))
+done
+[ $ok = 1 ] || yok "baglanti-yok"
+echo "HAZIR up=$(upi)" > "$DURUM"
+kmsg 5 "HAZIR (bagli, adres var, rota var; up=$(upi))"
+exit 0

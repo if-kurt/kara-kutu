@@ -1,0 +1,165 @@
+#!/bin/sh
+# Kara Kutu G59-C: Wi-Fi kopma bekcisi (ana hat Debian, kk-wifi-bekci2.timer: acilistan 5 dk sonra, 120 sn'de bir). Debian tarafinda dash.
+# Karar: wlan0 "kotu" ornegi (wpa_state != COMPLETED | wlan0 varsayilan rota yok | gateway'e ping yok) KRITER_SN (1200 sn = 20 dk) KESINTISIZ
+#   surerse tek eylem: systemctl reboot normal (DT mode-normal 0x10 -> bootloader kernel'i acar; ana hat kalir; BOOTLOADER DEGIL, FLAS YOK).
+#   systemctl basarisizsa yedek: kk-alan kapat wifi-yedek + busybox-kk reboot -f (kk-reboot2 yalniz bootloader kabul eder).
+# Tek iyi ornek sayaci sifirlar; iki ornek arasi > BOSLUK_SN (900) ise sayim yeniden baslar.
+# Sinirlar: 6 sa'te >= 1 ya da 24 sa'te >= 3 eylem -> eylem yok (SINIR); ardisik 3 eylem (arada iyi ornek yok) -> DUR;
+#   kayit bozuk -> ardisik=3 + 6 sa kilidi; gelecekteki kayit -> "simdi eylem yapilmis" sayilir.
+# SSH beklemesi: uptime < SSH_PENCERE_SN ya da son SSH_PENCERE_SN sn'de ssh "Accepted ... from 172.16.42.2|192.168.1.x" ya da kurulu :2222
+#   baglantisi varsa BEKLE (okunamazsa da BEKLE).
+# Cift eylem yok: eylemden once /run/kk-saglik/eylem-yapildi konur (kk-saglik de bunu gorunce eylem vermez); dosya varsa bekci eylem vermez.
+# Kapatma: /run/kk-wifi/bekci.kapali (acilis boyunca). Sayac yeri: pmsg "kk-wifi-bekci: KAYIT 1 ..." (RAM; eMMC yazmasi YOK).
+# Test kipi: /run/kk-wifi/bekci-test.conf (yalniz KRITER_SN 120-1200, SSH_PENCERE_SN 60-1800, BOSLUK_SN 120-900; source EDILMEZ).
+# YAZMA YALNIZ: /run/kk-wifi, /run/kk-saglik/eylem-yapildi, /dev/kmsg, /dev/pmsg0, journald (logger), eylemde reboot. Sysfs/donanim YAZMASI YOK.
+# KK_WIFI_* ortam degiskenleri yalniz yerel sinama/QEMU icindir; cihaz birimleri bunlari vermez. KK_WIFI_KURU=1: reboot yazdirilir, yapilmaz.
+umask 077
+RUN=${KK_WIFI_RUN:-/run/kk-wifi}
+SAG=${KK_WIFI_SAGLIK_RUN:-/run/kk-saglik}
+PS=${KK_WIFI_PSTORE:-/sys/fs/pstore}
+KMSG=${KK_WIFI_KMSG:-/dev/kmsg}
+PMSG=${KK_WIFI_PMSG:-/dev/pmsg0}
+UPF=${KK_WIFI_UPTIME:-/proc/uptime}
+BOOTF=${KK_WIFI_BOOTID:-/proc/sys/kernel/random/boot_id}
+SB=${KK_WIFI_SBIN:-/usr/local/sbin}
+KURU=${KK_WIFI_KURU:-0}
+KRITER=1200; PENCERE=1800; BOSLUK=900
+ALTI_SA=21600; BIR_GUN=86400; GUN_AZAMI=3; ARDISIK_AZAMI=3; KALP=1800
+
+upi() { cut -d. -f1 "$UPF"; }
+rd() { cat "$1" 2>/dev/null; }
+sayi() { case ${1:-x} in *[!0-9]*) return 1;; esac; [ ${#1} -le 9 ]; }
+alan() { echo " $1 " | tr ' ' '\n' | sed -n "s/^$2=//p" | head -n 1; }
+kmsg() { echo "<$1>kk-wifi-bekci: $2" >> "$KMSG" 2>/dev/null; return 0; }
+pmsg() { echo "kk-wifi-bekci: $1" >> "$PMSG" 2>/dev/null; return 0; }
+jr() { logger -t kk-wifi-bekci2 -p "daemon.$1" -- "$2" 2>/dev/null; return 0; }
+ilan() { kmsg 4 "$1"; pmsg "$1"; jr notice "$1"; }
+
+[ "$KURU" = 0 ] || [ "$KURU" = 1 ] || exit 64
+mkdir -p "$RUN" && chmod 700 "$RUN" || exit 0
+up=$(upi); sayi "$up" || exit 0
+
+# test kipi (kosul: kullanici eslesmesi tam satir; deger araligi disi -> gercek esik)
+TC=$RUN/bekci-test.conf
+if [ -f "$TC" ]; then
+	t_al() { v=$(grep -x "$1=[0-9]*" "$TC" | tail -n 1 | cut -d= -f2); sayi "$v" && [ "$v" -ge "$2" ] && [ "$v" -le "$3" ] && echo "$v"; }
+	v=$(t_al KRITER_SN 120 1200) && KRITER=$v
+	v=$(t_al SSH_PENCERE_SN 60 1800) && PENCERE=$v
+	v=$(t_al BOSLUK_SN 120 900) && BOSLUK=$v
+fi
+
+# karar: yalniz anahtar degisince (ya da KALP sn'de bir) yazilir. $1 = anahtar (IYI|BEKLE|EYLEM|KAPALI|OLCULEMEDI|SINIR|DUR), $2 = ayrinti
+karar() {
+	son=$(rd "$RUN/b-karar"); kalp=$(rd "$RUN/b-kalp"); sayi "$kalp" || kalp=0
+	if [ "$son" != "$1" ] || [ $((up - kalp)) -ge $KALP ]; then
+		ilan "karar=$1 $2 up=$up kriter=${KRITER}s"
+		echo "$1" > "$RUN/b-karar"; echo "$up" > "$RUN/b-kalp"
+	fi
+}
+
+[ -f "$RUN/bekci.kapali" ] && { karar KAPALI "(bekci.kapali var)"; exit 0; }
+[ -f "$SAG/eylem-yapildi" ] && exit 0	# eylem verildi (kk-saglik ya da bu bekci); kapanis suruyor
+
+# ---------------- pmsg kaydi ----------------
+kayit_yaz() {	# $1 = son durum (calisiyor|eylem)
+	g="KAYIT 1 top=$(( TABAN + up )) eylem=$EYL ardisik=$ARD boot=$(cut -c1-8 "$BOOTF" 2>/dev/null) up=$up son=$1"
+	pmsg "$g sag=$(printf %s "$g" | sha256sum | cut -c1-16)"
+}
+onceki_oku() {	# -> KAYNAK (pmsg|yok|bozuk), PTOP, PEYL, PARD, PSON
+	KAYNAK=yok; PTOP=0; PEYL=-; PARD=0; PSON=-
+	f=$PS/pmsg-ramoops-0
+	[ -s "$f" ] || return 0
+	l=$(tr -d '\000' < "$f" | grep -a '^kk-wifi-bekci: KAYIT 1 ' | tail -n 1)
+	[ -n "$l" ] || return 0
+	g=${l#kk-wifi-bekci: }; govde=${g% sag=*}; s=${g##* sag=}
+	KAYNAK=bozuk
+	[ "$govde" != "$g" ] && [ "$(printf %s "$govde" | sha256sum | cut -c1-16)" = "$s" ] || return 0
+	PTOP=$(alan "$govde" top); PEYL=$(alan "$govde" eylem); PARD=$(alan "$govde" ardisik); PSON=$(alan "$govde" son)
+	sayi "$PTOP" && sayi "$PARD" || { PTOP=0; PARD=0; PEYL=-; return 0; }
+	case $PEYL in -) ;; *[!0-9,]*|,*|*,|*,,*|'') PTOP=0; PARD=0; PEYL=-; return 0;; esac
+	KAYNAK=pmsg
+}
+bas() {	# acilis basina bir kez: gecmisi tasi
+	onceki_oku
+	TABAN=$PTOP
+	if [ "$KAYNAK" = bozuk ]; then	# sayac bozuk: ardisik = azami, 6 sa kilidi (eylem "simdi" yapilmis sayilir)
+		EYL=$TABAN; ARD=$ARDISIK_AZAMI
+	else
+		ARD=0; [ "$PSON" = eylem ] && ARD=$PARD
+		EYL=-; for e in $(echo "$PEYL" | tr ',' ' '); do
+			[ "$e" = - ] && continue
+			[ "$e" -gt "$TABAN" ] && e=$TABAN	# gelecekteki kayit -> simdi
+			[ "$e" -gt $((TABAN - BIR_GUN)) ] && { [ "$EYL" = - ] && EYL=$e || EYL="$EYL,$e"; }
+		done
+	fi
+	echo "$TABAN" > "$RUN/b-taban"; echo "$EYL" > "$RUN/b-eylem"; echo "$ARD" > "$RUN/b-ardisik"; : > "$RUN/b-bas"
+	kmsg 5 "bas: onceki=$KAYNAK taban=$TABAN eylem=$EYL ardisik=$ARD up=$up"
+	kayit_yaz calisiyor
+}
+if [ -f "$RUN/b-bas" ]; then TABAN=$(rd "$RUN/b-taban"); EYL=$(rd "$RUN/b-eylem"); ARD=$(rd "$RUN/b-ardisik")
+	sayi "$TABAN" && sayi "$ARD" && [ -n "$EYL" ] || { TABAN=0; EYL=0; ARD=$ARDISIK_AZAMI; }
+else bas; fi
+TOP=$((TABAN + up))
+
+# ---------------- olcum ----------------
+NED=; PINGNOT=
+wst=$(timeout -k 2 8 wpa_cli -p "$RUN" -i wlan0 status 2>/dev/null | sed -n 's/^wpa_state=//p' | head -n 1)
+[ "$wst" = COMPLETED ] || NED="wpa:${wst:-yok}"
+gw=$(timeout -k 2 5 ip -4 route show default dev wlan0 2>/dev/null | sed -n 's/^default via \([0-9.]*\) .*/\1/p' | head -n 1)
+if [ -z "$gw" ]; then NED="${NED:+$NED,}rota-yok"
+elif command -v ping >/dev/null 2>&1; then
+	timeout -k 2 12 ping -n -q -c 3 -W 2 -I wlan0 "$gw" >/dev/null 2>&1 || NED="${NED:+$NED,}ping"
+else PINGNOT=" ping=yok"; fi
+
+kotu_bas=$(rd "$RUN/b-kotu-bas"); son_ornek=$(rd "$RUN/b-son-ornek"); sayi "$son_ornek" || son_ornek=$up
+echo "$up" > "$RUN/b-son-ornek"
+
+if [ -z "$NED" ]; then	# iyi
+	rm -f "$RUN/b-kotu-bas"
+	if [ "$ARD" != 0 ]; then ARD=0; echo 0 > "$RUN/b-ardisik"; kayit_yaz calisiyor; fi
+	karar IYI "(wpa=COMPLETED rota+ping tamam$PINGNOT)"
+	exit 0
+fi
+# kotu: kesintisizlik; ornekler arasi > BOSLUK ise sayim yeniden baslar
+if ! sayi "$kotu_bas" || [ $((up - son_ornek)) -gt "$BOSLUK" ] || [ "$kotu_bas" -gt "$up" ]; then kotu_bas=$up; echo "$up" > "$RUN/b-kotu-bas"; fi
+sure=$((up - kotu_bas))
+if [ "$sure" -lt "$KRITER" ]; then karar BEKLE "(kotu=$NED sure=${sure}s)"; exit 0; fi
+
+# kriter doldu: bekleme kosullari
+if [ "$up" -lt "$PENCERE" ]; then karar BEKLE "(erken: up<${PENCERE}s; kotu=$NED sure=${sure}s)"; exit 0; fi
+ssh_var() {	# 0 = bekle (SSH var ya da okunamadi)
+	j=$(timeout -k 2 15 journalctl -u ssh -b -o short-monotonic --no-pager 2>/dev/null) || return 0
+	t=$(printf '%s\n' "$j" | grep -E 'Accepted .* from (172\.16\.42\.2|192\.168\.1\.[0-9]+) ' | tail -n 1 | sed -n 's/^\[ *\([0-9]*\)\..*/\1/p')
+	if sayi "$t" && [ "$t" -ge $((up - PENCERE)) ]; then return 0; fi
+	k=$(timeout -k 2 5 ss -Htn state established '( sport = :2222 )' 2>/dev/null) || return 0
+	[ -n "$k" ] && return 0
+	return 1
+}
+if ssh_var; then karar BEKLE "(ssh: son ${PENCERE}s'de oturum var/okunamadi; kotu=$NED sure=${sure}s)"; exit 0; fi
+
+# sinirlar
+[ "$ARD" -ge "$ARDISIK_AZAMI" ] && { karar DUR "(ardisik=$ARD >= $ARDISIK_AZAMI; arada iyi ornek yok; kotu=$NED sure=${sure}s)"; exit 0; }
+n6=0; n24=0
+for e in $(echo "$EYL" | tr ',' ' '); do
+	[ "$e" = - ] && continue
+	[ "$e" -gt $((TOP - ALTI_SA)) ] && n6=$((n6 + 1))
+	[ "$e" -gt $((TOP - BIR_GUN)) ] && n24=$((n24 + 1))
+done
+[ "$n6" -ge 1 ] && { karar SINIR "(6sa'te eylem=$n6 >= 1; eylem=$EYL; kotu=$NED sure=${sure}s)"; exit 0; }
+[ "$n24" -ge "$GUN_AZAMI" ] && { karar SINIR "(24sa'te eylem=$n24 >= $GUN_AZAMI; eylem=$EYL; kotu=$NED sure=${sure}s)"; exit 0; }
+
+# EYLEM (tek): once ortak isaret + kayit, sonra reboot normal
+mkdir -p "$SAG" 2>/dev/null; : > "$SAG/eylem-yapildi"
+[ "$EYL" = - ] && EYL=$TOP || EYL="$EYL,$TOP"
+ARD=$((ARD + 1))
+echo "$EYL" > "$RUN/b-eylem"; echo "$ARD" > "$RUN/b-ardisik"
+kayit_yaz eylem
+ilan "EYLEM: reboot normal (neden=$NED kotu_sure=${sure}s eylem=$EYL ardisik=$ARD up=$up)"
+echo EYLEM > "$RUN/b-karar"
+[ "$KURU" = 1 ] && { kmsg 4 "KURU: reboot atlandi (yalniz yerel sinama/QEMU)"; exit 0; }
+timeout 30 systemctl reboot normal && exit 0
+ilan "systemctl reboot normal basarisiz (rc=$?); kk-alan kapat wifi-yedek + busybox-kk reboot -f (normal)"
+[ -x "$SB/kk-alan" ] && timeout 90 "$SB/kk-alan" kapat wifi-yedek > /dev/null 2>&1
+[ -x "$SB/busybox-kk" ] && exec "$SB/busybox-kk" reboot -f
+kmsg 3 "yedek reboot yolu yok (busybox-kk eksik); SP805 devrede"
+exit 0

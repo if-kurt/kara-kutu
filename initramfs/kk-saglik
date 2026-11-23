@@ -1,0 +1,229 @@
+#!/bin/sh
+# kk-saglik — Kara Kutu G57 G-1: günlük kip (kk_gunluk=1) sağlık bekçisi. Tasarım: work/g57/g1/SONUC-g1.md §2.
+# Yalnız kk_gunluk=1 iken init üst katmana kurar (tek kaynak: initramfs /bin/kk-saglik): kk-saglik.timer (açılıştan 30 sn
+# sonra, 60 sn'de bir) -> kk-saglik.service (oneshot, 50 sn üst süre). Test imajlarında (kk_gunluk yok) KURULMAZ; orada
+# D1 güvenlik ağı (oturum sınırı + çip WDT + SP805) aynen.
+#   kk-saglik yokla   bir tur: koşulları oku; N sn kesintisiz kötü -> sınırlar izin verirse tek eylem (reboot HEDEF)
+#   kk-saglik durum   tek satır durum (stdout; yazma yok)
+# Koşullar (hepsi YALNIZ OKUMA): (1) sshd PORT'ta dinliyor (ss); (2) systemctl is-system-running: running; degraded ise
+#   YOKSAY listesi dışında başarısız birim yok; starting/initializing yalnız uptime < BASLA iken; stopping -> bu tur hiçbir şey
+#   yapılmaz; (3) sigorta satırı yok (dmesg "kk: sigorta: ...-> reboot bootloader"; çekirdek kendi reboot'unu yapamadıysa
+#   N beklenmez, sınırlar uygulanmaz).
+# "usb0 yok != bozuk": usb0 (ana makine kapalı / kablo adaptörde) YALNIZ bilgi satırıdır, reboot nedeni değildir.
+# Eylem sınırları (birikimli çalışma süresiyle; RTC yok, duvar saati güvenilmez): son eylemden bu yana >= ARA sn; son GUN sn'de
+#   en çok GUN_AZAMI eylem; bekçi eylemiyle biten ardışık açılış < ARDISIK. Biri tutmazsa: eylem YOK, "SINIR" satırı, bekçi bu
+#   açılışta durur (yalnız log + kalp). Birikimli süre ve eylem geçmişi pmsg'de (pstore) açılıştan açılışa taşınır:
+#   "kk-saglik: KAYIT 1 top=<sn> eylem=<t,t|-> ardisik=<n> boot=<8> up=<sn> son=<calisiyor|eylem|sinir> sag=<16>"
+#   (sag = gövdenin sha256'sının ilk 16'sı; bozuk/eksik kayıt -> geçmiş sıfırdan, "onceki=yok|bozuk"). 4.9 açılışı ya da
+#   bekçisiz imaj zinciri keser (insan/otomasyon araya girmiştir).
+# HEDEF = bootloader (bugünkü tek yol; reboot-param da bootloader). G-2/G-3'ten sonra: ilk eylem ana hatta normal açılış,
+#   SINIR durumunda eRecovery'de kalma (tasarım kararı; SONUC §2.6). Hedef değişikliği bu dosyada tek satır.
+# YAZMA YALNIZ: /run/kk-saglik (tmpfs), /dev/kmsg, /dev/pmsg0, journald (logger; yalnız geçişler + kalp), eylemde
+#   systemctl reboot (başarısızsa kk-alan kapat saglik-yedek + kk-reboot2). pstore dosyaları SİLİNMEZ. sysfs/donanım yazması YOK.
+# KK_SAGLIK_* ortam değişkenleri yalnız yerel sınama ve QEMU içindir; init ve cihaz birimleri bunları vermez.
+# G58 G-1 (work/g58/g1/SONUC-g1.md §2): (1) GÖZLEM kipi: cmdline kk_saglik_gozlem=1 (yalnız G-1K kısa oturum imajının DT
+#   bootargs'ı; init o imajda oturum sınırı zamanlayıcısını da kurar = D1 yerinde). Kod yolu G-1U ile aynı; yalnız eylem/sınır
+#   anında reboot ve "dur" YOK: "GOZLEM: EYLEM olurdu (...)" / "GOZLEM: SINIR olurdu (...)" satırı (kmsg + pmsg + journald),
+#   kötü dönem başına 1 kez (SAGLIKLI sonrası yeniden). pmsg KAYIT'ta eylem/ardisik ARTMAZ (son=calisiyor). Sigorta yolu da
+#   gözlemde eylemsiz (CHG_EN=0 çekirdekte zaten yapıldı; oturum sınırı + SP805 + çip WDT yerinde). (2) YOKSAY varsayılanına
+#   kk-idle-bekci.service (O-G1-3: A0 DUR / geri alma = cpuidle kapalı güvenli durum; reboot düzeltmez, günlük koşuyu bitirir).
+#   (3) Sigorta deseni hedeften bağımsız: "-> reboot (bootloader|erecovery)" (G-2 dalı karakutu,sigorta-hedef; bu imajda DT'de
+#   verilmez = bootloader, tasarım G-3). HEDEF bootloader kalır (tasarım G-3).
+# G58-D (work/g58/g1u6/SONUC.md §2.2): (4) G-6 pil koruması: her turda kk-pil-koruma sysfs `durum` dosyasının İLK ALANI okunur
+#   (seviye=K0|K1|K2|K3; durum_show yalnız önbelleği biçimler, çipe/HKADC'ye dokunmaz). K1|K2|K3 -> neden pil-K<n>, sigorta gibi
+#   HEMEN eylem (N ve ara/gün/ardışık sınırları uygulanmaz; hedef bootloader). Gözlem kipinde yalnız GOZLEM satırı (pil için ayrı
+#   kötü-dönem işareti). Dosya yok/okunamıyor/tanımsız -> açılış başına 1 "PIL:" uyarısı, eylem YOK (K1 eşiği sürücüde, burada değil).
+set -u
+export LC_ALL=C PATH=${KK_SAGLIK_PATH:-/usr/sbin:/usr/bin:/sbin:/bin}
+trap '' PIPE
+SURUM=g58
+N=${KK_SAGLIK_N:-600}
+BASLA=${KK_SAGLIK_BASLANGIC:-900}
+ARA=${KK_SAGLIK_ARA:-21600}
+GUN=${KK_SAGLIK_GUN:-86400}
+GUN_AZAMI=${KK_SAGLIK_GUN_AZAMI:-3}
+ARDISIK=${KK_SAGLIK_ARDISIK:-2}
+KALP=${KK_SAGLIK_KALP:-3600}
+PORT=${KK_SAGLIK_PORT:-2222}
+YOKSAY=${KK_SAGLIK_YOKSAY:-kk-alan.service,kk-idle-bekci.service}
+KURU=${KK_SAGLIK_KURU:-0}
+HEDEF=bootloader
+PS=${KK_SAGLIK_PSTORE:-/sys/fs/pstore}
+RUN=${KK_SAGLIK_RUN:-/run/kk-saglik}
+KMSG=${KK_SAGLIK_KMSG:-/dev/kmsg}
+PMSG=${KK_SAGLIK_PMSG:-/dev/pmsg0}
+UPF=${KK_SAGLIK_UPTIME:-/proc/uptime}
+BOOTF=${KK_SAGLIK_BOOTID:-/proc/sys/kernel/random/boot_id}
+NET=${KK_SAGLIK_NET:-/sys/class/net}
+IDLE=${KK_SAGLIK_IDLE:-/run/kk-idle/a0}
+WD=${KK_SAGLIK_WD:-/sys/class/watchdog/watchdog0}
+SB=${KK_SAGLIK_SBIN:-/usr/local/sbin}
+CMDF=${KK_SAGLIK_CMDLINE:-/proc/cmdline}
+PILF=${KK_SAGLIK_PIL:-/sys/bus/platform/devices/kk-pil-koruma/pil/durum}
+GOZ=0; for a in $(cat "$CMDF" 2>/dev/null); do [ "$a" = kk_saglik_gozlem=1 ] && GOZ=1; done	# G58: yalnız AÇAR; başka değer = yok
+KIP=gunluk; [ "$GOZ" = 1 ] && KIP=gunluk-gozlem
+
+sayi() { case ${1:-x} in *[!0-9]*) return 1;; esac; [ ${#1} -le 9 ]; }
+for v in "$N" "$BASLA" "$ARA" "$GUN" "$GUN_AZAMI" "$ARDISIK" "$KALP" "$PORT"; do
+	sayi "$v" || { echo "kk-saglik: gecersiz sayi '$v'" >&2; exit 64; }; done
+[ "$N" -ge 60 ] && [ "$KALP" -ge 60 ] && [ "$GUN_AZAMI" -ge 1 ] && [ "$ARDISIK" -ge 1 ] || { echo "kk-saglik: sinir tutarsiz" >&2; exit 64; }
+case $KURU in 0|1) ;; *) exit 64;; esac
+
+upi() { cut -d. -f1 "$UPF"; }
+rd() { cat "$1" 2>/dev/null; }
+n0() { case ${1:-x} in *[!0-9]*) echo 0;; *) echo "$1";; esac; }
+alan() { echo " $1 " | tr ' ' '\n' | sed -n "s/^$2=//p" | head -n 1; }
+kmsg() { echo "<$1>kk-saglik: $2" >> "$KMSG" 2>/dev/null; return 0; }
+pmsg() { echo "kk-saglik: $1" >> "$PMSG" 2>/dev/null; return 0; }
+jr() { logger -t kk-saglik -p "daemon.$1" -- "$2" 2>/dev/null; return 0; }
+ilan() { kmsg 4 "$1"; pmsg "$1"; jr warning "$1"; }	# geçişler: kmsg (pstore konsol) + pmsg + journald
+BOOT=$(cut -c1-8 "$BOOTF" 2>/dev/null)
+pil_oku() {	# -> PSEV (K0|K1|K2|K3; boş = okunamadı/tanımsız). Yalnız okuma: sysfs durum dosyasının ilk satırı
+	PSEV=; [ -r "$PILF" ] || return 0
+	pl=$(timeout 5 head -n 1 "$PILF" 2>/dev/null); pv=$(alan "$pl" seviye)
+	case $pv in K0|K1|K2|K3) PSEV=$pv;; esac
+}
+pil_uyari() {	# açılış başına 1 kez; eylem YOK
+	[ -f "$RUN/pil-uyari" ] && return 0; : > "$RUN/pil-uyari"
+	ilan "PIL: kk-pil-koruma durum okunamadi ya da tanimsiz (yol=$PILF): pil korumasi bu acilista YOK; eylem YAPILMADI. up=$(upi)"
+}
+
+# ---------------- pmsg kaydı (açılıştan açılışa) ----------------
+kayit_yaz() {	# $1 = son durum
+	g="KAYIT 1 top=$(( TABAN + $(upi) )) eylem=$EYL ardisik=$ARD boot=${BOOT:-yok} up=$(upi) son=$1"
+	pmsg "$g sag=$(printf %s "$g" | sha256sum | cut -c1-16)"
+	echo "$(upi)" > "$RUN/kalp"
+}
+onceki_oku() {	# -> KAYNAK (pmsg|yok|bozuk), PTOP, PEYL, PARD, PSON
+	KAYNAK=yok; PTOP=0; PEYL=-; PARD=0; PSON=-
+	f=$PS/pmsg-ramoops-0
+	[ -s "$f" ] || return 0
+	l=$(tr -d '\000' < "$f" | grep -a '^kk-saglik: KAYIT 1 ' | tail -n 1)
+	[ -n "$l" ] || return 0
+	g=${l#kk-saglik: }; govde=${g% sag=*}; s=${g##* sag=}
+	KAYNAK=bozuk
+	[ "$govde" != "$g" ] && [ "$(printf %s "$govde" | sha256sum | cut -c1-16)" = "$s" ] || return 0
+	PTOP=$(alan "$govde" top); PEYL=$(alan "$govde" eylem); PARD=$(alan "$govde" ardisik); PSON=$(alan "$govde" son)
+	sayi "$PTOP" && sayi "$PARD" || { PTOP=0; PARD=0; PEYL=-; return 0; }
+	case $PEYL in -) ;; *[!0-9,]*|,*|*,|*,,*|'') PTOP=0; PARD=0; PEYL=-; return 0;; esac
+	KAYNAK=pmsg
+}
+bas() {	# açılış başına bir kez: geçmişi taşı, ilk kaydı yaz
+	onceki_oku
+	TABAN=$PTOP
+	ARD=0; [ "$PSON" = eylem ] && ARD=$PARD
+	EYL=-; for e in $(echo "$PEYL" | tr ',' ' '); do
+		[ "$e" = - ] && continue
+		[ "$e" -gt $((TABAN - GUN)) ] && { [ "$EYL" = - ] && EYL=$e || EYL="$EYL,$e"; }
+	done
+	echo "$TABAN" > "$RUN/taban"; echo "$EYL" > "$RUN/eylem"; echo "$ARD" > "$RUN/ardisik"
+	ilan "BASLADI $SURUM kip=$KIP N=${N}s hedef=$HEDEF sinir: ara=${ARA}s gun=${GUN_AZAMI}/${GUN}s ardisik<$ARDISIK; onceki=$KAYNAK son=$PSON taban=${TABAN}s eylem=$EYL ardisik=$ARD; wd=$(rd $WD/state)/$(rd $WD/timeout)s port=$PORT yoksay=$YOKSAY kuru=$KURU pil=$(pil_oku; echo ${PSEV:-yok}) up=$(upi)"
+	kayit_yaz calisiyor
+}
+
+# ---------------- koşullar (yalnız okuma) ----------------
+DURUM=
+degerlendir() {	# -> NED (boş = sağlıklı), DURUM
+	NED=
+	[ -n "$(timeout 15 ss -Hltn "sport = :$PORT" 2>/dev/null)" ] || NED="${NED}ssh-yok,"
+	DURUM=$(timeout 20 systemctl is-system-running 2>/dev/null); DURUM=${DURUM:-bos}
+	case $DURUM in
+	running) ;;
+	starting|initializing) [ "$(upi)" -lt "$BASLA" ] || NED="${NED}durum-$DURUM,";;
+	degraded)
+		F=$(timeout 20 systemctl list-units --state=failed --plain --no-legend --no-pager 2>/dev/null | awk '{print $1}' | sort -u)
+		K=; for u in $F; do case " $(echo "$YOKSAY" | tr ',' ' ') " in *" $u "*) ;; *) K="$K+$u";; esac; done
+		[ -z "$K" ] || NED="${NED}degraded:${K#+},";;
+	stopping) ;;
+	*) NED="${NED}durum-$DURUM,";;
+	esac
+	[ "$(timeout 15 dmesg 2>/dev/null | grep -cE 'kk: sigorta: .*-> reboot (bootloader|erecovery)')" = 0 ] || NED="${NED}sigorta,"
+	# G58-D: G-6 pil koruması (yalnız okuma). K1|K2|K3 -> pil-K<n> (hemen eylem); okunamıyor -> açılış başına 1 uyarı, eylem yok
+	pil_oku; if [ -n "$PSEV" ]; then case $PSEV in K0) ;; *) NED="${NED}pil-$PSEV,";; esac; else pil_uyari; fi
+	NED=${NED%,}
+}
+ag() {	# bilgi: usb0 (yok = ana makine kapalı / kablo adaptörde; reboot nedeni DEĞİL)
+	[ -e "$NET/usb0" ] || { echo usb0:yok; return 0; }
+	a=$(timeout 10 ip -4 -o addr show dev usb0 2>/dev/null | awk '{print $4}' | head -n 1)
+	echo "usb0:$(rd "$NET/usb0/operstate")/${a:-adres-yok}"
+}
+
+# ---------------- eylem ve sınırlar ----------------
+gozlem() {	# G58 gözlem kipi: $1 EYLEM|SINIR $2 ayrıntı. Kötü dönem başına 1 satır; reboot/dur YOK; eylem/ardisik değişmez.
+	gz=gozlem; case ",$NED," in *,pil-K*) gz=gozlem-pil;; esac	# G58-D: pil için ayrı işaret (önceki kötü dönemin satırı pil'i gizlemesin)
+	[ -f "$RUN/$gz" ] && return 0
+	echo "$1 $(upi)" > "$RUN/$gz"
+	ilan "GOZLEM: $1 olurdu ($2): eylem YAPILMADI (kk_saglik_gozlem=1; oturum siniri D1). neden=$NED kotu_sure=${SURE}s birikimli=${T}s eylem=$EYL ardisik=$ARD ag=$AG up=$(upi)"
+}
+sinir() {	# $1 kural
+	[ "$GOZ" = 1 ] && { gozlem SINIR "$1"; return 0; }
+	touch "$RUN/durdu"
+	ilan "SINIR ($1): eylem YAPILMADI; bekci bu acilista durdu (yalniz log + kalp). neden=$NED kotu_sure=${SURE}s birikimli=${T}s eylem=$EYL ardisik=$ARD ag=$AG"
+	kayit_yaz sinir
+}
+eylem() {	# $1 neden
+	[ "$GOZ" = 1 ] && { gozlem EYLEM "reboot $HEDEF; neden=$1"; return 0; }
+	[ "$EYL" = - ] && EYL=$T || EYL="$EYL,$T"; ARD=$((ARD + 1))
+	echo "$EYL" > "$RUN/eylem"; echo "$ARD" > "$RUN/ardisik"; touch "$RUN/eylem-yapildi"
+	ilan "EYLEM: reboot $HEDEF (neden=$1 kotu_sure=${SURE}s birikimli=${T}s eylem=$EYL ardisik=$ARD ag=$AG a0=$(rd "$IDLE") up=$(upi))"
+	kayit_yaz eylem
+	[ "$KURU" = 1 ] && { kmsg 4 "KURU: reboot atlandi (yalniz yerel sinama)"; exit 0; }
+	sync
+	timeout 30 systemctl reboot "$HEDEF" && exit 0
+	ilan "systemctl reboot $HEDEF basarisiz (rc=$?); kk-alan kapat saglik-yedek + kk-reboot2 $HEDEF"
+	[ -x "$SB/kk-alan" ] && timeout 90 "$SB/kk-alan" kapat saglik-yedek > /dev/null 2>&1
+	exec "$SB/kk-reboot2" "$HEDEF"
+}
+eylem_dene() {	# $1 neden; sınırlar
+	[ -f "$RUN/durdu" ] && return 0
+	son=0; c=0
+	for e in $(echo "$EYL" | tr ',' ' '); do [ "$e" = - ] && continue; son=$e; [ "$e" -gt $((T - GUN)) ] && c=$((c + 1)); done
+	[ "$EYL" != - ] && [ $((T - son)) -lt "$ARA" ] && { sinir "ara: son eylemden $((T - son)) sn < $ARA"; return 0; }
+	[ "$c" -ge "$GUN_AZAMI" ] && { sinir "gun: son $GUN sn'de $c eylem >= $GUN_AZAMI"; return 0; }
+	[ "$ARD" -ge "$ARDISIK" ] && { sinir "ardisik: bekci eylemiyle biten ardisik acilis $ARD >= $ARDISIK"; return 0; }
+	eylem "$1"
+}
+
+yokla() {
+	mkdir -p "$RUN" || exit 70
+	[ -f "$RUN/eylem-yapildi" ] && exit 0	# eylem verildi; kapanış sürüyor
+	[ -f "$RUN/taban" ] || bas
+	TABAN=$(n0 "$(rd "$RUN/taban")"); EYL=$(rd "$RUN/eylem"); EYL=${EYL:--}; ARD=$(n0 "$(rd "$RUN/ardisik")")
+	degerlendir
+	[ "$DURUM" = stopping ] && exit 0
+	t=$(upi); T=$((TABAN + t)); AG=$(ag); SURE=0
+	if [ -z "$NED" ]; then
+		if [ -f "$RUN/kotu_bas" ]; then
+			ilan "SAGLIKLI: kotu donem bitti ($(( t - $(n0 "$(rd "$RUN/kotu_bas")") )) sn; neden=$(rd "$RUN/kotu_neden")) durum=$DURUM ag=$AG up=$t"
+			rm -f "$RUN/kotu_bas" "$RUN/kotu_neden" "$RUN/gozlem" "$RUN/gozlem-pil"
+		fi
+	else
+		if [ ! -f "$RUN/kotu_bas" ]; then
+			echo "$t" > "$RUN/kotu_bas"; echo "$NED" > "$RUN/kotu_neden"
+			ilan "KOTU basladi: $NED (durum=$DURUM; N=${N}s sonra eylem; ag=$AG; up=$t)"
+		elif [ "$NED" != "$(rd "$RUN/kotu_neden")" ]; then
+			kmsg 4 "KOTU suruyor, neden degisti: $(rd "$RUN/kotu_neden") -> $NED (up=$t)"; echo "$NED" > "$RUN/kotu_neden"
+		fi
+		SURE=$(( t - $(n0 "$(rd "$RUN/kotu_bas")") ))
+		case ",$NED," in
+		*,sigorta,*) [ -f "$RUN/durdu" ] && rm -f "$RUN/durdu"; eylem "$NED (sigorta: N ve sinirlar uygulanmaz)";;
+		*,pil-K1,*|*,pil-K2,*|*,pil-K3,*) [ -f "$RUN/durdu" ] && rm -f "$RUN/durdu"; eylem "$NED (pil: N ve sinirlar uygulanmaz)";;	# G58-D
+		*) [ "$SURE" -ge "$N" ] && eylem_dene "$NED";;
+		esac
+	fi
+	[ "$AG" = "$(rd "$RUN/ag")" ] || { kmsg 6 "ag: $AG (bilgi; usb0 yok = ana makine kapali/kablo adaptorde, reboot nedeni DEGIL; up=$t)"; echo "$AG" > "$RUN/ag"; }
+	if [ $(( t - $(n0 "$(rd "$RUN/kalp")") )) -ge "$KALP" ]; then
+		kayit_yaz calisiyor
+		m="kalp: durum=$DURUM neden=${NED:-yok} birikimli=${T}s eylem=$EYL ardisik=$ARD durdu=$([ -f "$RUN/durdu" ] && echo evet || echo hayir) ag=$AG a0=$(rd "$IDLE") up=$t"
+		kmsg 6 "$m"; jr info "$m"
+	fi
+	exit 0
+}
+durum() {
+	echo "kk-saglik: durum $SURUM kip=$KIP gozlem_son=$(rd "$RUN/gozlem" | tr ' ' '@') N=${N}s hedef=$HEDEF taban=$(rd "$RUN/taban") eylem=$(rd "$RUN/eylem") ardisik=$(rd "$RUN/ardisik") kotu_bas=$(rd "$RUN/kotu_bas") neden=$(rd "$RUN/kotu_neden") durdu=$([ -f "$RUN/durdu" ] && echo evet || echo hayir) eylem_yapildi=$([ -f "$RUN/eylem-yapildi" ] && echo evet || echo hayir) ag=$(rd "$RUN/ag") up=$(upi)"
+}
+case ${1:-} in
+yokla) yokla;;
+durum) durum;;
+*) echo "kullanim: kk-saglik yokla|durum" >&2; exit 64;;
+esac
