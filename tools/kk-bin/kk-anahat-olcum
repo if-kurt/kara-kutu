@@ -1,0 +1,70 @@
+#!/bin/bash
+# Kara Kutu kk-bin (G57 G-8 önerisi): ana hat Debian'ında (SSH 2222) onaylı ölçüm betiği cihaz/anahat-olcum.sh'ı
+#   `sudo -n sh -s` ile çalıştır. YALNIZ OKUMA. kk-olcum'un ana hat karşılığı (boot0/1 YOK; ana hatta aygıtı yok).
+#   kk-anahat-olcum <cikti-dosyasi>
+# Hedef SABİT: ${KK_KULLANICI:-kk}@172.16.42.1 port 2222, known_hosts_anahat. Komuttan ÖNCE aynı SSH ana bağlantısında `uname -r`
+#   ^6\.12\.[0-9]+-kk-g[0-9]+$ olmalı (kk-anahat-ssh ile aynı kural); değilse betik GÖNDERİLMEZ (65).
+# Cihaz betiği: sha SABİT (aşağıda); özel geçici kopyaya alınır, sha kopyada denetlenir, gönderilen o kopyadır.
+#   Betik argv'de değil stdin'de gider: kk-anahat-ssh'ın 1000 karakter sınırı uzak komut (`sudo -n sh -s`) içindir;
+#   sudo'nun kmsg'ye yazdığı komut satırı yalnız "sh -s" olur (Ş12 kirlenmesi yok).
+# Çıktı /opt/kara-kutu/work/ altında YENİ bir dosya; dizini var olmalı. Ekrana oeminfo satırı basılmaz (dosyada kalır).
+# Çıkış: 0 tamam / 1 bağlantı yok / 2 çıktı eksik (OLCUM-SON yok) / 64 girdi / 65 uname tutmadı / 66 cihaz betiği sha /
+#        77 kilit dolu / diğer = uzak sh rc. Log: /opt/kara-kutu/work/kk-bin-log/kk-bin.log. Kurmak/değiştirmek bakımcı onayı.
+# Ortak kk-bin kilidi (flock -n, work/kk-bin-log/kk-bin.kilit, fd 9); doluysa çıkış 77, hiçbir şey yapılmaz.
+# Ölü adam (G58): bu araç kk-fb-oluadam'ın IZLEME listesinde; satırları ([kk-anahat-olcum]) "kk-bin sessizliği"ni bozmaz.
+set -u
+KB=/opt/kara-kutu/tools/kk-bin
+S=$KB/cihaz/anahat-olcum.sh
+SSHA=245caf82078c6a26528c88e925f35179c8c39f3444420dc557372de975c03a44
+H=172.16.42.1; P=2222; U=${KK_KULLANICI:-kk}; SURE=300
+UNAME_RE='^6\.12\.[0-9]+-kk-g[0-9]+$'
+LOG=/opt/kara-kutu/work/kk-bin-log/kk-bin.log; mkdir -p "${LOG%/*}"
+log() { echo "$(date -u '+%F %T.%3N') UTC [kk-anahat-olcum] $*" | tee -a "$LOG"; }
+[ "$P" = 2222 ] || exit 70
+[ $# -eq 1 ] || { echo "kullanim: kk-anahat-olcum <cikti-dosyasi>" >&2; exit 64; }
+OUT=$(realpath -m -- "$1")
+case $OUT in /opt/kara-kutu/work/?*) ;; *) log "DUR: cikti work/ disinda: $OUT"; exit 64;; esac
+[ -e "$OUT" ] && { log "DUR: cikti zaten var (ustune yazilmaz): $OUT"; exit 64; }
+[ -d "${OUT%/*}" ] || { log "DUR: dizin yok: ${OUT%/*}"; exit 64; }
+# --- G49 ortak kilit (kural 17'nin mekanik karşılığı): cihaza dokunan kk-bin çağrıları tek tek. ---
+# flock, work/kk-bin-log/kk-bin.kilit üzerinde, fd 9. Bekleme YOK (-n): kilit doluysa hemen 77, cihaz işlemi yapılmaz.
+# Miras: iç içe kk-bin çağrısı üstünün fd 9'unu (aynı açık dosya tanımı) devralır; flock aynı tanımda yeniden başarılı.
+# Ortam değişkeni (KK_KILIT_SAHIBI) yalnız log içindir; mirası açmaz. Kilidi tutan süreç ve fd 9'u devralan çocukları
+# bitince (SIGKILL dahil) çekirdek kilidi bırakır: bayat kilit olmaz (dosya kalır, içeriği yalnız "son sahip" bilgisi).
+KK_KILIT=/opt/kara-kutu/work/kk-bin-log/kk-bin.kilit
+kk_kilit() {
+	local kl=${KK_KILIT%/*}/kk-bin.log ad=${0##*/} t
+	t=$(date -u '+%F %T.%3N')
+	mkdir -p "${KK_KILIT%/*}" || exit 77
+	if [ /proc/$$/fd/9 -ef "$KK_KILIT" ] && flock -n 9; then
+		echo "$t UTC [$ad] kilit: miras (sahip ${KK_KILIT_SAHIBI:-?}; pid $$)" >> "$kl"; return 0
+	fi
+	if exec 9>>"$KK_KILIT" && flock -n 9; then
+		export KK_KILIT_SAHIBI="pid=$$ $ad"
+		printf 'pid=%s betik=%s arg=%.80s bas=%s UTC\n' $$ "$ad" "$*" "$t" > "$KK_KILIT"
+		echo "$t UTC [$ad] kilit: alindi (pid $$)" >> "$kl"; return 0
+	fi
+	echo "$t UTC [$ad] RED: kk-bin kilidi mesgul (son sahip: $(head -c 200 "$KK_KILIT" 2>/dev/null | tr -d '\n')); cihaz islemi YAPILMADI; cikis 77" | tee -a "$kl" >&2
+	exit 77
+}
+kk_kilit "$@"
+# --- G49 ortak kilit sonu ---
+
+# --- G57 G-8 ana hat SSH (kk-anahat-ssh ile aynı seçenekler; tek ana bağlantı, uname aynı bağlantıda) ---
+T=$(mktemp -d) || exit 70
+O=(-p "$P" -o UserKnownHostsFile="$KB/known_hosts_anahat" -o StrictHostKeyChecking=yes -o BatchMode=yes
+   -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -S "$T/s")
+bitir() { [ -S "$T/s" ] && ssh "${O[@]}" -O exit "$U@$H" >/dev/null 2>&1 </dev/null; rm -f -- "$T/s" "$T/b"; rmdir -- "$T" 2>/dev/null; }
+trap bitir EXIT
+cp -- "$S" "$T/b" 2>/dev/null && [ "$(sha256sum "$T/b" | cut -c1-64)" = "$SSHA" ] || { log "DUR: cihaz betigi $S sha'si beklenen degil; gonderilmedi"; exit 66; }
+timeout 20 ssh "${O[@]}" -M -fN "$U@$H" 9>&- 2>/dev/null </dev/null || { log "DUR: $H:$P baglanti yok"; exit 1; }
+un=$(timeout 20 ssh "${O[@]}" "$U@$H" 'uname -r' 2>/dev/null </dev/null | tr -d '\r')
+if ! [[ $un =~ $UNAME_RE ]]; then log "DUR: uname tutmadi ($H:$P uname='${un:0:80}'); betik GONDERILMEDI"; exit 65; fi
+# --- ana hat SSH sonu ---
+
+log "uname OK: $H:$P $un; anahat-olcum.sh (${SSHA:0:16}) -> $OUT"
+timeout "$SURE" ssh "${O[@]}" "$U@$H" 'sudo -n sh -s' < "$T/b" > "$OUT" 2>&1; R=$?
+[ "$(tail -n 1 "$OUT")" = OLCUM-SON ] || { log "UYARI: cikti eksik (OLCUM-SON yok; rc=$R) $OUT"; grep -v '^oeminfo' "$OUT"; [ $R -ne 0 ] && exit "$R"; exit 2; }
+log "olcum -> $OUT rc=$R bolum=$(grep -cE '^[a-z_]+ /dev/mmcblk0p[0-9]+ [a-z_]+ [0-9a-f]{64}$' "$OUT") $(grep -m1 -oE '^wb=[0-9]+ cmd2x=[0-9]+' "$OUT")"
+grep -v '^oeminfo' "$OUT"
+exit "$R"

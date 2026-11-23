@@ -1,0 +1,79 @@
+#!/bin/bash
+# Kara Kutu kk-bin (G48 3.1, Wi-Fi M2-0; bakımcı onaylı, kural 12): 4.9 Debian'dan Hi1102 firmware girdilerini SALT OKUMA ile alır.
+#   kk-49-wifi-fw-al <cikti-dizini>     (cikti-dizini: /opt/kara-kutu/work/ altında, henüz OLMAYAN yeni dizin)
+# Cihazda çalışan komutlar yalnız: uname -r, stat, sha256sum, cat (aşağıdaki 4 sabit yol için). sudo yok, mount yok,
+# başka dosya okunmaz. Yollar, boylar ve beklenen sha256'lar betiğe gömülü (kaynak: work/g16/B2-vendor-mount.txt,
+# 4.9 canlı ölçüm; work/g47/wifi-m2/TASARIM-M2.md §1.2).
+# Denetim: uzak stat (normal dosya + boy), uzak sha256 = gömülü; aktarım sonrası yerel sha256 = gömülü = uzak.
+# Tutmayan dosya yerelde silinir, betik DUR (3). /vendor bağlı değilse stat başarısız -> DUR (bağlama denenmez).
+# Çıkış: 0 tamam / 3 dur / 64 girdi / 65 doğrulama (öz sha, uname). Log: work/kk-bin-log/kk-bin.log.
+# Öz doğrulama: bu dosyanın sha256'sı SHA256SUMS'taki satırla aynı değilse çalışmaz.
+# Değiştirmek bakımcının onayını gerektirir (docs/guvenlik-tasarimi.md kural 12).
+# G50 (bakımcı onayı (i), G49 önerisi): ortak kk-bin kilidi (flock -n, work/kk-bin-log/kk-bin.kilit, fd 9); doluysa çıkış 77, hiçbir şey yapılmaz.
+set -u
+KB=/opt/kara-kutu/tools/kk-bin; ME=$(realpath -- "$0")
+LOG=/opt/kara-kutu/work/kk-bin-log/kk-bin.log; mkdir -p "${LOG%/*}"
+log() { echo "$(date -u '+%F %T.%3N') UTC [kk-49-wifi-fw-al] $*" | tee -a "$LOG" >&2; }
+[ $# -eq 1 ] || { echo "kullanim: kk-49-wifi-fw-al <cikti-dizini>" >&2; exit 64; }
+OUT=$(realpath -m -- "$1")
+case $OUT in /opt/kara-kutu/work/?*/?*) ;; *) log "DUR: cikti work/<gorev>/ altinda degil: $OUT"; exit 64;; esac
+[ -e "$OUT" ] && { log "DUR: cikti zaten var: $OUT"; exit 64; }
+[ -d "${OUT%/*}" ] || { log "DUR: ust dizin yok: ${OUT%/*}"; exit 64; }
+want=$(awk '$2=="kk-49-wifi-fw-al"{print $1}' "$KB/SHA256SUMS"); have=$(sha256sum "$ME" | cut -c1-64)
+[ -n "$want" ] && [ "$want" = "$have" ] || { log "DUR: betik sha256 SHA256SUMS ile tutmadi ($have)"; exit 65; }
+SSH=(ssh -o UserKnownHostsFile=$KB/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=10
+     -o ServerAliveInterval=5 -o ServerAliveCountMax=3 ${KK_KULLANICI:-kk}@172.16.42.1)
+# stdin /dev/null: ssh, döngünün okuduğu listeyi tüketmesin
+r() { timeout "${2:-60}" "${SSH[@]}" "$1" < /dev/null; }
+# --- G49 ortak kilit (kural 17'nin mekanik karşılığı): cihaza dokunan kk-bin çağrıları tek tek. ---
+# flock, work/kk-bin-log/kk-bin.kilit üzerinde, fd 9. Bekleme YOK (-n): kilit doluysa hemen 77, cihaz işlemi yapılmaz.
+# Miras: iç içe kk-bin çağrısı üstünün fd 9'unu (aynı açık dosya tanımı) devralır; flock aynı tanımda yeniden başarılı.
+# Ortam değişkeni (KK_KILIT_SAHIBI) yalnız log içindir; mirası açmaz. Kilidi tutan süreç ve fd 9'u devralan çocukları
+# bitince (SIGKILL dahil) çekirdek kilidi bırakır: bayat kilit olmaz (dosya kalır, içeriği yalnız "son sahip" bilgisi).
+KK_KILIT=/opt/kara-kutu/work/kk-bin-log/kk-bin.kilit
+kk_kilit() {
+	local kl=${KK_KILIT%/*}/kk-bin.log ad=${0##*/} t
+	t=$(date -u '+%F %T.%3N')
+	mkdir -p "${KK_KILIT%/*}" || exit 77
+	if [ /proc/$$/fd/9 -ef "$KK_KILIT" ] && flock -n 9; then
+		echo "$t UTC [$ad] kilit: miras (sahip ${KK_KILIT_SAHIBI:-?}; pid $$)" >> "$kl"; return 0
+	fi
+	if exec 9>>"$KK_KILIT" && flock -n 9; then
+		export KK_KILIT_SAHIBI="pid=$$ $ad"
+		printf 'pid=%s betik=%s arg=%.80s bas=%s UTC\n' $$ "$ad" "$*" "$t" > "$KK_KILIT"
+		echo "$t UTC [$ad] kilit: alindi (pid $$)" >> "$kl"; return 0
+	fi
+	echo "$t UTC [$ad] RED: kk-bin kilidi mesgul (son sahip: $(head -c 200 "$KK_KILIT" 2>/dev/null | tr -d '\n')); cihaz islemi YAPILMADI; cikis 77" | tee -a "$kl" >&2
+	exit 77
+}
+kk_kilit "$@"
+# --- G49 ortak kilit sonu ---
+
+# --- gömülü liste: yol | boy (B) | sha256 ---
+LISTE='/vendor/firmware/cr4_asic.bin|396012|8cf0e9aaebb95802c1028f1c35e563d283a772a19e88eac99e3febe8c32a08fc
+/vendor/firmware/CPU_RAM_SCHED.bin|362008|d7f10bf984c341951d768dab91b7789263c53de200eed24f92397dd91ce0b557
+/vendor/firmware/CPU_RAM_WBS.bin|40436|67220c16ab4af69c5783a206eff2e6a7a49b5985a1d17325260d0e86048c7c42
+/vendor/etc/cfg_marie_lx1a_hisi.ini|10785|c3c2a41a32766aa4fa014d92f278f7afe38c5c3fd3ec4182b82b2d5d3e2fa846'
+
+un=$(r 'uname -r' 2>/dev/null | tr -d '\r')
+[[ $un =~ ^4\.9\. ]] || { log "DUR: uname tutmadi ('${un:0:60}'); hicbir sey yapilmadi"; exit 65; }
+mkdir -m 0755 "$OUT" || { log "DUR: mkdir $OUT"; exit 64; }
+log "uname OK $un; cikti $OUT; 4 dosya (salt okuma)"
+HATA=0; : > "$OUT/SHA256SUMS"
+while IFS='|' read -r yol boy sha; do
+	ad=${yol##*/}
+	st=$(r "stat -c '%F|%s' -- '$yol'" 2>&1 | tr -d '\r')
+	if [ "$st" != "regular file|$boy" ]; then log "DUR: $yol stat '${st:0:80}' (beklenen 'regular file|$boy')"; HATA=1; continue; fi
+	us=$(r "sha256sum -- '$yol'" 2>&1 | cut -c1-64)
+	if [ "$us" != "$sha" ]; then log "DUR: $yol uzak sha256 '${us:0:64}' beklenen $sha"; HATA=1; continue; fi
+	r "cat -- '$yol'" 120 > "$OUT/$ad" 2>/dev/null; rc=$?
+	ys=$(sha256sum "$OUT/$ad" | cut -c1-64); yb=$(stat -c %s "$OUT/$ad")
+	if [ $rc != 0 ] || [ "$ys" != "$sha" ] || [ "$yb" != "$boy" ]; then
+		rm -f -- "$OUT/$ad"; log "DUR: $yol aktarim rc=$rc boy=$yb sha=${ys:0:16}… (beklenen $boy ${sha:0:16}…); yerel kopya silindi"; HATA=1; continue
+	fi
+	chmod 0444 "$OUT/$ad"; echo "$sha  $ad" >> "$OUT/SHA256SUMS"
+	log "TAMAM: $yol boy=$boy sha256=$sha (uzak = yerel = gomulu)"
+done <<< "$LISTE"
+chmod 0444 "$OUT/SHA256SUMS"
+if [ $HATA = 0 ]; then log "SONUC tamam: 4/4 dosya -> $OUT"; exit 0; fi
+log "SONUC dur: $(wc -l < "$OUT/SHA256SUMS")/4 dosya alindi; cikti $OUT"; exit 3

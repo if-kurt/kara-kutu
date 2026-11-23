@@ -1,0 +1,163 @@
+#!/bin/bash
+# Kara Kutu kk-bin (G46, Ö1): 4.9 Debian'da ekran zincirinin bedeli. Yalnız 4.9'un kendi servislerinin işlemleri:
+#   kk-charge durdurulur -> charge_data/enable_charger=1 (G12 düğümü) -> ibat dengelenir (ACL) ->
+#   fb0 blank 0 (açık, kk-ekran "ac") <-> 4 (kapalı, kk-ekran "kapat") A/B pencereleri (30 sn, B A A B B A A B) ->
+#   geri: blank=4, enable_charger=0, kk-charge start, kk-ekran restart; durum doğrulanır.
+#   kk-49-ekran-olcum <cikti-dosyasi>        (çıktı /opt/kara-kutu/work/ altında YENİ dosya)
+# Okunan dosyalar (kural 15a; okuma işleyicisi yan etkisiz): Battery/{current_now,voltage_now,temp,capacity,status},
+#   charge_data/{enable_charger,iin_thermal,iin_runningtest} (yalnız alan okuma, huawei_charger.c:4713-4750),
+#   thermal_zone0/temp, lcd_backlight0/brightness (önbellek), dmesg.
+# Güvenlik: cihaz betiği systemd-run birimi (SSH koparsa da sürer) + aynı betikte trap EXIT/INT/TERM/HUP geri alma +
+#   RuntimeMaxSec=600 (SIGTERM -> trap) + ölü adam zamanlayıcısı (660 sn; aynı betiğin "geri" modu). Normal bitişte
+#   zamanlayıcı aynı betikte durdurulur ve doğrulanır ("deadman iptal (saglikli)"). Pil >= 42,0 C ya da SoC >= 65 C ->
+#   ölçüm kesilir, geri alınır.
+# Öz doğrulama: bu dosyanın sha256'sı SHA256SUMS'taki satırla aynı değilse çalışmaz. Hedef uname ^4\.9\. olmalı.
+# Çıkış: 0 tamam / 3 ölçüm kesildi ya da son durum tutmadı / 1 bağlantı / 64 girdi / 65 doğrulama.
+# Değiştirmek bakımcının onayını gerektirir (docs/guvenlik-tasarimi.md kural 12). Log: work/kk-bin-log/kk-bin.log.
+# G50 (bakımcı onayı (i), G49 önerisi): ortak kk-bin kilidi (flock -n, work/kk-bin-log/kk-bin.kilit, fd 9); doluysa çıkış 77, hiçbir şey yapılmaz.
+set -u
+KB=/opt/kara-kutu/tools/kk-bin; ME=$(realpath -- "$0")
+LOG=/opt/kara-kutu/work/kk-bin-log/kk-bin.log; mkdir -p "${LOG%/*}"
+log() { echo "$(date -u '+%F %T.%3N') UTC [kk-49-ekran-olcum] $*" | tee -a "$LOG" >&2; }
+[ $# -eq 1 ] || { echo "kullanim: kk-49-ekran-olcum <cikti-dosyasi>" >&2; exit 64; }
+OUT=$(realpath -m -- "$1")
+case $OUT in /opt/kara-kutu/work/*) ;; *) log "DUR: cikti work/ disinda: $OUT"; exit 64;; esac
+[ -e "$OUT" ] && { log "DUR: cikti zaten var: $OUT"; exit 64; }
+[ -d "${OUT%/*}" ] || { log "DUR: dizin yok: ${OUT%/*}"; exit 64; }
+want=$(awk '$2=="kk-49-ekran-olcum"{print $1}' "$KB/SHA256SUMS"); have=$(sha256sum "$ME" | cut -c1-64)
+[ -n "$want" ] && [ "$want" = "$have" ] || { log "DUR: betik sha256 SHA256SUMS ile tutmadi ($have)"; exit 65; }
+CIHAZ=$(sed -n '/^#--- CIHAZ BASI ---$/,/^#--- CIHAZ SONU ---$/p' "$ME")
+CSHA=$(printf '%s\n' "$CIHAZ" | sha256sum | cut -c1-64)
+SSH=(ssh -o UserKnownHostsFile=$KB/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=10
+     -o ServerAliveInterval=5 -o ServerAliveCountMax=3 ${KK_KULLANICI:-kk}@172.16.42.1)
+r() { timeout 30 "${SSH[@]}" "$1"; }
+# --- G49 ortak kilit (kural 17'nin mekanik karşılığı): cihaza dokunan kk-bin çağrıları tek tek. ---
+# flock, work/kk-bin-log/kk-bin.kilit üzerinde, fd 9. Bekleme YOK (-n): kilit doluysa hemen 77, cihaz işlemi yapılmaz.
+# Miras: iç içe kk-bin çağrısı üstünün fd 9'unu (aynı açık dosya tanımı) devralır; flock aynı tanımda yeniden başarılı.
+# Ortam değişkeni (KK_KILIT_SAHIBI) yalnız log içindir; mirası açmaz. Kilidi tutan süreç ve fd 9'u devralan çocukları
+# bitince (SIGKILL dahil) çekirdek kilidi bırakır: bayat kilit olmaz (dosya kalır, içeriği yalnız "son sahip" bilgisi).
+KK_KILIT=/opt/kara-kutu/work/kk-bin-log/kk-bin.kilit
+kk_kilit() {
+	local kl=${KK_KILIT%/*}/kk-bin.log ad=${0##*/} t
+	t=$(date -u '+%F %T.%3N')
+	mkdir -p "${KK_KILIT%/*}" || exit 77
+	if [ /proc/$$/fd/9 -ef "$KK_KILIT" ] && flock -n 9; then
+		echo "$t UTC [$ad] kilit: miras (sahip ${KK_KILIT_SAHIBI:-?}; pid $$)" >> "$kl"; return 0
+	fi
+	if exec 9>>"$KK_KILIT" && flock -n 9; then
+		export KK_KILIT_SAHIBI="pid=$$ $ad"
+		printf 'pid=%s betik=%s arg=%.80s bas=%s UTC\n' $$ "$ad" "$*" "$t" > "$KK_KILIT"
+		echo "$t UTC [$ad] kilit: alindi (pid $$)" >> "$kl"; return 0
+	fi
+	echo "$t UTC [$ad] RED: kk-bin kilidi mesgul (son sahip: $(head -c 200 "$KK_KILIT" 2>/dev/null | tr -d '\n')); cihaz islemi YAPILMADI; cikis 77" | tee -a "$kl" >&2
+	exit 77
+}
+kk_kilit "$@"
+# --- G49 ortak kilit sonu ---
+
+un=$(r 'uname -r' 2>/dev/null | tr -d '\r')
+[[ $un =~ ^4\.9\. ]] || { log "DUR: uname tutmadi ('${un:0:60}'); hicbir sey yapilmadi"; exit 65; }
+onceki=$(r 'systemctl is-active kk-49-ekran-olcum.service kk-49-ekran-deadman.timer' 2>/dev/null | tr '\n' ' ')
+[ "$onceki" = "inactive inactive " ] || { log "DUR: onceki birim/zamanlayici durumu: '$onceki'"; exit 65; }
+uz=$(printf '%s\n' "$CIHAZ" | timeout 30 "${SSH[@]}" 'sudo -n tee /run/kk-49-ekran-olcum.sh >/dev/null && sudo -n sh -n /run/kk-49-ekran-olcum.sh && sha256sum /run/kk-49-ekran-olcum.sh' 2>&1 | cut -c1-64)
+[ "$uz" = "$CSHA" ] || { log "DUR: cihaz betigi sha tutmadi (yerel $CSHA, uzak '${uz:0:64}')"; exit 65; }
+log "uname OK $un; cihaz betigi /run/kk-49-ekran-olcum.sh sha $CSHA; olcum baslatiliyor -> $OUT"
+r 'sudo -n systemd-run --unit=kk-49-ekran-olcum --collect -p RuntimeMaxSec=600 /bin/sh /run/kk-49-ekran-olcum.sh olc' >/dev/null 2>&1 \
+	|| { log "DUR: systemd-run basarisiz"; exit 3; }
+
+# Bekleme: sleep + kesin üst süre (80 x 10 sn); durum birim adıyla sorulur (öz eşleşme yok; kural 16).
+st=active; i=0
+while [ $i -lt 80 ]; do
+	sleep 10; i=$((i+1))
+	st=$(r 'systemctl is-active kk-49-ekran-olcum.service' 2>/dev/null | tr -d '\r'); st=${st:-baglanti-yok}
+	case $st in active|activating|baglanti-yok) ;; *) break;; esac
+done
+log "olcum birimi: $st (${i}0 sn)"
+r 'cat /run/kk-49-ekran-olcum.log' > "$OUT" 2>&1
+son=$(r 'cat /sys/class/hw_power/charger/charge_data/enable_charger; systemctl is-active kk-charge.service kk-ekran.service kk-49-ekran-deadman.timer kk-49-ekran-olcum.service' 2>/dev/null | tr '\n' ' ')
+echo "son durum: enable_charger kk-charge kk-ekran deadman olcum = $son" >> "$OUT"
+awk '/ ornek p[0-9]+-[AB] /{split($4,k,"-"); for(i=5;i<=NF;i++) if($i~/^cur=/){c=substr($i,5); s[k[2]]+=c; n[k[2]]++; p[$4]+=c; q[$4]++}}
+     END{for(w in p) printf "pencere %s ort=%.1f mA (n=%d)\n", w, p[w]/q[w], q[w] | "sort -V";
+         close("sort -V"); for(x in s) printf "kosul %s ort=%.1f mA (n=%d)\n", x, s[x]/n[x], n[x];
+         if(n["A"]&&n["B"]) printf "B-A (ekran zinciri, pil tarafi, + = sarj) = %.1f mA\n", s["B"]/n["B"]-s["A"]/n["A"]}' "$OUT" | tee -a "$OUT"
+ok=1
+[ "$son" = "0 active active inactive inactive " ] || ok=0
+grep -q 'deadman iptal (saglikli)' "$OUT" || ok=0
+grep -q 'olcum tamam' "$OUT" || ok=0
+grep -E 'DUR:|geri:|deadman' "$OUT" | cut -c1-240 >&2
+if [ $ok = 1 ]; then log "TAMAM: olcum bitti, geri alindi, son durum dogru ($son)"; exit 0; fi
+log "UYARI: olcum kesildi ya da son durum beklenen degil ($son); cikti $OUT"; exit 3
+
+#--- CIHAZ BASI ---
+#!/bin/sh
+# kk-49-ekran-olcum cihaz tarafi (4.9 Debian, root, systemd-run). Mod: olc | geri. KK_* yalniz yerel sinama icindir.
+K=${KK_KOK:-}; SC=${KK_SC:-systemctl}; SR=${KK_SR:-systemd-run}; KM=${KK_KMSG:-/dev/kmsg}; SL=${KK_SL:-5}
+NODE=$K/sys/class/hw_power/charger/charge_data; B=$K/sys/class/power_supply/Battery
+FB=$K/sys/class/graphics/fb0/blank; BL=$K/sys/class/leds/lcd_backlight0/brightness
+SOC=$K/sys/class/thermal/thermal_zone0/temp; L=$K/run/kk-49-ekran-olcum.log; DM=kk-49-ekran-deadman
+log() { echo "$(date -u +%T) up=$(cut -d' ' -f1 $K/proc/uptime) $*" >> $L; echo "<4>kk: ekran-olcum: $*" > $KM; }
+sayi() { case "$1" in ''|-|*[!0-9-]*) return 1;; esac; return 0; }
+geri() {
+	echo 4 > $FB; a=$?; echo 0 > $NODE/enable_charger; b=$?
+	$SC start kk-charge.service; c=$?; $SC restart kk-ekran.service; d=$?
+	log "geri: blank=4 rc=$a enable_charger=0 rc=$b okunan=$(cat $NODE/enable_charger) kk-charge start rc=$c $($SC is-active kk-charge.service) kk-ekran restart rc=$d $($SC is-active kk-ekran.service)"
+}
+son() {
+	trap - EXIT INT TERM HUP; geri
+	$SC stop $DM.timer; sleep 1; t=$($SC is-active $DM.timer)
+	if [ "$t" != active ] && [ "$t" != activating ]; then log "deadman iptal (saglikli) timer=$t"; else log "UYARI: deadman iptal edilemedi timer=$t"; fi
+	dmesg | grep -E 'set_bl|bl_updated|panel_power_on|lcdkit_o|fb0, -' | tail -40 | sed 's/^/dmesg: /' >> $L
+	log "bitti"
+}
+ornek() {
+	c=$(cat $B/current_now); v=$(cat $B/voltage_now); bt=$(cat $B/temp); s=$(cat $SOC)
+	log "ornek $1 cur=$c volt=$v bt=$bt soc=$s bl=$(cat $BL) st=$(cat $B/status)"
+	sayi "$c" && sayi "$bt" && sayi "$s" || { log "DUR: okunamadi cur=$c bt=$bt soc=$s"; exit 3; }
+	[ "$bt" -ge 420 ] && { log "DUR: pil sicak bt=$bt"; exit 3; }
+	[ "$s" -ge 65000 ] && { log "DUR: SoC sicak soc=$s"; exit 3; }
+	return 0
+}
+olc() {
+	: > $L
+	log "basla: uname=$(uname -r) enable_charger=$(cat $NODE/enable_charger) iin_thermal=$(cat $NODE/iin_thermal) iin_rt=$(cat $NODE/iin_runningtest) cap=$(cat $B/capacity) st=$(cat $B/status) kk-charge=$($SC is-active kk-charge.service) kk-ekran=$($SC is-active kk-ekran.service)"
+	[ -z "$K" ] && { case $(uname -r) in 4.9.*) ;; *) log "DUR: 4.9 degil"; exit 2;; esac; }
+	for f in $NODE/enable_charger $B/current_now $B/voltage_now $B/temp $B/capacity $SOC $BL; do [ -r $f ] || { log "DUR: okunamaz $f"; exit 2; }; done
+	[ -w $FB ] && [ -w $NODE/enable_charger ] || { log "DUR: yazilamaz fb0/blank ya da enable_charger"; exit 2; }
+	[ "$($SC is-active kk-charge.service)" = active ] && [ "$($SC is-active kk-ekran.service)" = active ] || { log "DUR: kk-charge/kk-ekran aktif degil"; exit 2; }
+	[ "$(cat $NODE/enable_charger)" = 0 ] || { log "DUR: enable_charger 0 degil"; exit 2; }
+	cap=$(cat $B/capacity); sayi "$cap" && [ "$cap" -le 62 ] || { log "DUR: capacity=$cap"; exit 2; }
+	ornek p0-on
+	$SR --unit=$DM --on-active=660 --timer-property=AccuracySec=1s /bin/sh /run/kk-49-ekran-olcum.sh geri >/dev/null 2>&1
+	[ "$($SC is-active $DM.timer)" = active ] || { log "DUR: deadman kurulamadi"; exit 2; }
+	log "deadman kuruldu (660 sn)"
+	trap son EXIT; trap 'exit 4' INT TERM HUP
+	$SC stop kk-charge.service; log "kk-charge stop rc=$? $($SC is-active kk-charge.service)"
+	[ "$($SC is-active kk-charge.service)" = active ] && { log "DUR: kk-charge durmadi"; exit 3; }
+	echo 1 > $NODE/enable_charger; log "enable_charger=1 rc=$? okunan=$(cat $NODE/enable_charger)"
+	[ "$(cat $NODE/enable_charger)" = 1 ] || { log "DUR: enable_charger 1 olmadi"; exit 3; }
+	# Dengeleme (ekran kapalı): en az 60 sn, son 6 örnek (30 sn) aralığı <= 15 mA, en çok 150 sn.
+	n=0; h=""; ok=0
+	while [ $n -lt 30 ]; do
+		sleep $SL; n=$((n+1)); ornek d$n; h="$h $c"; set -- $h; [ $# -gt 6 ] && shift $(($# - 6)); h="$*"
+		if [ $n -ge 12 ]; then
+			mn=$1; mx=$1; for x; do [ $x -lt $mn ] && mn=$x; [ $x -gt $mx ] && mx=$x; done
+			[ $((mx - mn)) -le 15 ] && [ $mn -gt 0 ] && { ok=1; break; }
+		fi
+	done
+	[ $ok = 1 ] || { log "DUR: ibat dengelenmedi (son 6: $h)"; exit 3; }
+	log "dengelendi: ${n} ornek, son 6: $h"
+	w=0
+	for k in B A A B B A A B; do
+		w=$((w+1)); [ $k = A ] && v=0 || v=4
+		echo $v > $FB; log "pencere $w $k blank=$v rc=$?"
+		sleep $SL; j=0; while [ $j -lt 5 ]; do sleep $SL; j=$((j+1)); ornek p$w-$k; done
+	done
+	log "olcum tamam"
+	exit 0
+}
+case "${1:-}" in
+olc) olc;;
+geri) geri; log "deadman: geri alma calisti (zamanlayici)";;
+*) echo "kullanim: $0 olc|geri"; exit 2;;
+esac
+#--- CIHAZ SONU ---

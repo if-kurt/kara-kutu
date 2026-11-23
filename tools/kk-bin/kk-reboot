@@ -1,0 +1,121 @@
+#!/bin/bash
+# Kara Kutu kk-bin: yazılımla yeniden başlatma (tuş yok) ve ardından izleme.
+#   kk-reboot debian-bootloader          Debian'dan `systemctl reboot bootloader`; önce USB 60 sn kararlılık; 90 sn fastboot bekler
+#   kk-reboot debian-normal              Debian'dan `systemctl reboot`; 240 sn SSH bekler
+#   kk-reboot fastboot-normal [herhangi|22]
+#                                        `fastboot -s <CIHAZ_SERI> reboot` (T0 log'a); herhangi = 300 sn (test),
+#                                        22 = 240 sn Debian SSH (dönüş). Varsayılan herhangi.
+#   kk-reboot anahat-bootloader          (G57 G-8) ana hat Debian'dan (2222, kk-anahat-ssh uname denetimi) `systemctl reboot
+#                                        bootloader` (DT mode-bootloader 0x01; bugünkü bütün imajlarda); önce USB 60 sn
+#                                        kararlılık; 90 sn fastboot bekler
+#   kk-reboot anahat-normal              (G58 O-G8-4 onaylı) `systemctl reboot normal` (0x10): yalnız ANAHAT_G2=1 VE cihaz
+#                                        açılış satırı "reboot-mode DT: … normal=0x10 …; beyaz liste TUTTU" ise. 2222'nin
+#                                        kapanması (≤ 120 sn) + 300 sn 2222 bekler; sonra boot_id değişmiş olmalı
+#   kk-reboot anahat-erecovery           (G58 O-G8-4 onaylı) `systemctl reboot erecovery` (0x08): ANAHAT_G2=1 VE DT
+#                                        satırında erecovery=0x08; 240 sn telnet 23 (v5.1e kurtarma) bekler
+# Çıkış kodu kk-izle'ninki (0 fb, 2 ssh 22, 3 telnet 23, 5 ssh 2222, 9 süre doldu); 1 = ön koşul tutmadı (reboot
+#   YAPILMADI); 6 = anahat-normal: 2222 geldi ama boot_id değişmedi/okunamadı; 64 = girdi.
+# Değiştirmek bakımcının onayını gerektirir.
+# G50 (bakımcı onayı (i), G49 önerisi): ortak kk-bin kilidi (flock -n, work/kk-bin-log/kk-bin.kilit, fd 9); doluysa çıkış 77, hiçbir şey yapılmaz.
+set -u
+KB=/opt/kara-kutu/tools/kk-bin; SERI=${KK_SERI:?KK_SERI ortam degiskeni (fastboot seri no) gerekli}
+LOG=/opt/kara-kutu/work/kk-bin-log/kk-bin.log; mkdir -p "${LOG%/*}"
+log() { echo "$(date -u '+%F %T.%3N') UTC [kk-reboot] $*" | tee -a "$LOG"; }
+SSH=(ssh -o UserKnownHostsFile=$KB/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=10 ${KK_KULLANICI:-kk}@172.16.42.1)
+ANAHAT_G2=1  # G57 G-8 kapısı; G58 O-G8-4 onaylı (G-2: mode-normal 0x10, mode-erecovery 0x08). İkinci kapı (cihazın DT satırı) aynen.
+MOD=${1:-}; HEDEF=${2:-herhangi}
+case "$#:$MOD" in
+	1:debian-bootloader|1:debian-normal|1:fastboot-normal|2:fastboot-normal) ;;
+	1:anahat-bootloader|1:anahat-normal|1:anahat-erecovery) ;;
+	*) echo "kullanim: kk-reboot debian-bootloader | debian-normal | fastboot-normal [herhangi|22] | anahat-bootloader | anahat-normal | anahat-erecovery" >&2; exit 64;;
+esac
+case $HEDEF in herhangi|22) ;; *) echo "DUR: hedef herhangi|22" >&2; exit 64;; esac
+case $MOD in anahat-normal|anahat-erecovery)
+	[ "$ANAHAT_G2" = 1 ] || { echo "DUR: $MOD G-2 onayi bekliyor (ANAHAT_G2=0); reboot yapilmadi" >&2; exit 64; };; esac
+# --- G49 ortak kilit (kural 17'nin mekanik karşılığı): cihaza dokunan kk-bin çağrıları tek tek. ---
+# flock, work/kk-bin-log/kk-bin.kilit üzerinde, fd 9. Bekleme YOK (-n): kilit doluysa hemen 77, cihaz işlemi yapılmaz.
+# Miras: iç içe kk-bin çağrısı üstünün fd 9'unu (aynı açık dosya tanımı) devralır; flock aynı tanımda yeniden başarılı.
+# Ortam değişkeni (KK_KILIT_SAHIBI) yalnız log içindir; mirası açmaz. Kilidi tutan süreç ve fd 9'u devralan çocukları
+# bitince (SIGKILL dahil) çekirdek kilidi bırakır: bayat kilit olmaz (dosya kalır, içeriği yalnız "son sahip" bilgisi).
+KK_KILIT=/opt/kara-kutu/work/kk-bin-log/kk-bin.kilit
+kk_kilit() {
+	local kl=${KK_KILIT%/*}/kk-bin.log ad=${0##*/} t
+	t=$(date -u '+%F %T.%3N')
+	mkdir -p "${KK_KILIT%/*}" || exit 77
+	if [ /proc/$$/fd/9 -ef "$KK_KILIT" ] && flock -n 9; then
+		echo "$t UTC [$ad] kilit: miras (sahip ${KK_KILIT_SAHIBI:-?}; pid $$)" >> "$kl"; return 0
+	fi
+	if exec 9>>"$KK_KILIT" && flock -n 9; then
+		export KK_KILIT_SAHIBI="pid=$$ $ad"
+		printf 'pid=%s betik=%s arg=%.80s bas=%s UTC\n' $$ "$ad" "$*" "$t" > "$KK_KILIT"
+		echo "$t UTC [$ad] kilit: alindi (pid $$)" >> "$kl"; return 0
+	fi
+	echo "$t UTC [$ad] RED: kk-bin kilidi mesgul (son sahip: $(head -c 200 "$KK_KILIT" 2>/dev/null | tr -d '\n')); cihaz islemi YAPILMADI; cikis 77" | tee -a "$kl" >&2
+	exit 77
+}
+kk_kilit "$@"
+# --- G49 ortak kilit sonu ---
+case $MOD in
+debian-bootloader)
+	"${SSH[@]}" true 2>/dev/null || { log "DUR: Debian SSH yok; reboot yapilmadi"; exit 1; }
+	"$KB/kk-usb-kontrol" 60 2>&1 | tee -a "$LOG"
+	[ "${PIPESTATUS[0]}" -eq 0 ] || { log "DUR: USB kararsiz; fastboot'a alinmadi"; exit 1; }
+	log "Debian: systemctl reboot bootloader"
+	"${SSH[@]}" 'sudo -n systemctl reboot bootloader' 2>&1 | tee -a "$LOG"
+	"$KB/kk-izle" fb-gecis 90 fb 2>&1 | tee -a "$LOG"; R=${PIPESTATUS[0]};;
+debian-normal)
+	"${SSH[@]}" true 2>/dev/null || { log "DUR: Debian SSH yok; reboot yapilmadi"; exit 1; }
+	log "Debian: systemctl reboot"
+	"${SSH[@]}" 'sudo -n systemctl reboot' 2>&1 | tee -a "$LOG"
+	timeout 15 tail -f /dev/null 9>&-  # G53: timeout kendi surec grubunda; kilit fd 9'u devralmasin (grup SIGKILL'inde <= 15 sn bayat kilit)
+	"$KB/kk-izle" debian-normal 240 22 2>&1 | tee -a "$LOG"; R=${PIPESTATUS[0]};;
+fastboot-normal)
+	timeout 10 fastboot devices 2>/dev/null | grep -qE "^$SERI[[:space:]]+fastboot" || { log "DUR: $SERI fastboot'ta degil"; exit 1; }
+	log "T0: fastboot -s $SERI reboot"
+	timeout 20 fastboot -s $SERI reboot 2>&1 | tee -a "$LOG"
+	if [ "$HEDEF" = 22 ]; then "$KB/kk-izle" donus 240 22 2>&1 | tee -a "$LOG"; R=${PIPESTATUS[0]}
+	else "$KB/kk-izle" T0 300 herhangi 2>&1 | tee -a "$LOG"; R=${PIPESTATUS[0]}; fi;;
+anahat-bootloader|anahat-normal|anahat-erecovery)
+	AH=${MOD#anahat-}
+	# 1) ana hat mı (kk-anahat-ssh: yalnız 2222 + uname ^6.12…-kk-g aynı bağlantıda; fd 9 miras), boot_id, reboot-mode DT satırı
+	on=$("$KB/kk-anahat-ssh" 'echo "boot=$(cat /proc/sys/kernel/random/boot_id)"; { sudo -n dmesg; sudo -n journalctl -k -b 0 -o cat --no-pager; } 2>/dev/null | grep -v -e sudo -e systemd | grep -m1 -oE "reboot-mode DT: offset 0x1e1 mask 0xff modlar: [a-z0-9= ]+; beyaz liste TUTTU"; echo ONKOSUL-SON'); r=$?
+	B0=$(sed -n 's/^boot=\([0-9a-f-]\{36\}\)$/\1/p' <<<"$on"); RM=$(grep -m1 -o 'modlar: [a-z0-9= ]*;' <<<"$on")
+	{ [ $r -eq 0 ] && grep -qx ONKOSUL-SON <<<"$on" && [ -n "$B0" ]; } || { log "DUR: ana hat 2222/uname/boot_id dogrulanamadi (kk-anahat-ssh cikis=$r); reboot yapilmadi"; exit 1; }
+	log "ana hat: boot=$B0 reboot-mode ${RM:-satir yok (G-2 oncesi imaj)}"
+	case $AH in
+		normal) [[ $RM == *" normal=0x10"* ]] || { log "DUR: DT'de normal=0x10 (beyaz liste TUTTU) yok; reboot yapilmadi"; exit 1; };;
+		erecovery) [[ $RM == *" erecovery=0x08"* ]] || { log "DUR: DT'de erecovery=0x08 (beyaz liste TUTTU) yok; reboot yapilmadi"; exit 1; };;
+		bootloader)
+			"$KB/kk-usb-kontrol" 60 2>&1 | tee -a "$LOG"
+			[ "${PIPESTATUS[0]}" -eq 0 ] || { log "DUR: USB kararsiz; fastboot'a alinmadi"; exit 1; };;
+	esac
+	# 2) reboot (bağlantının kopması beklenir: kk-anahat-ssh 255 ya da 0)
+	log "ana hat: systemctl reboot $AH"
+	"$KB/kk-anahat-ssh" "sudo -n systemctl reboot $AH"; r=$?
+	case $r in 0|255) ;; *) log "DUR: reboot komutu gitmedi (kk-anahat-ssh cikis=$r)"; exit 1;; esac
+	# 3) izleme
+	case $AH in
+	bootloader) "$KB/kk-izle" anahat-fb 90 fb 2>&1 | tee -a "$LOG"; R=${PIPESTATUS[0]};;
+	erecovery) "$KB/kk-izle" anahat-erec 240 23 2>&1 | tee -a "$LOG"; R=${PIPESTATUS[0]};;
+	normal)
+		k=0  # eski oturumun 2222'si kapanmadan izlemeye başlanmaz (yanlış "geldi" olmasın); en çok ~120 sn
+		while nc -z -w 1 172.16.42.1 2222 9>&- 2>/dev/null; do
+			[ $k -ge 120 ] && { log "UYARI: 2222 120 sn'de kapanmadi"; break; }
+			timeout 2 tail -f /dev/null 9>&-; k=$((k + 3))
+		done
+		log "2222 kapandi (~${k} sn); yeni acilis bekleniyor"
+		"$KB/kk-izle" anahat-normal 300 2222 2>&1 | tee -a "$LOG"; R=${PIPESTATUS[0]}
+		if [ "$R" = 5 ]; then
+			B1=
+			for i in 1 2 3; do
+				B1=$("$KB/kk-anahat-ssh" 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null | grep -xE '[0-9a-f-]{36}')
+				[ -n "$B1" ] && break
+				timeout 10 tail -f /dev/null 9>&-
+			done
+			if [ -n "$B1" ] && [ "$B1" != "$B0" ]; then log "yeni acilis dogrulandi: boot $B0 -> $B1"
+			else log "UYARI: 2222 geldi ama boot_id degismedi/okunamadi ('$B1')"; R=6; fi
+		fi;;
+	esac;;
+esac
+log "izle cikis=$R (0 fastboot, 2 ssh 22, 3 telnet 23, 5 ssh 2222, 6 boot_id ayni, 9 sure doldu)"
+exit "$R"

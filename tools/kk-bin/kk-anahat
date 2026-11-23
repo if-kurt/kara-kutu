@@ -1,0 +1,94 @@
+#!/bin/bash
+# Kara Kutu kk-bin (G32): ana hat ortamına (6.12, telnet 172.16.42.1:2323) TEK bir komut gönder, çıktısını yaz.
+#   kk-anahat '<komut>'
+# Hedef SABİT: 172.16.42.1 port 2323. Kurtarma ortamına (port 23) asla bağlanmaz ve komut göndermez.
+# Doğrulama (komut göndermeden ÖNCE): bağlantı açılır, karşılama satırı okunur; satır
+#   "KK-ANAHAT G<n> | uname=<6.12.N-kk-g<n>> |" biçiminde değilse HİÇBİR ŞEY GÖNDERMEDEN kapatılır.
+#   G33 (bakımcı onayı): imza görev numarasına bağlı değil; uname ^6\.12\.[0-9]+-kk-g[0-9]+$ (QEMU "q" varyantı ve 4.9 eşleşmez).
+# Komut: tek satır, 1-1000 karakter; satır sonu ya da denetim karakteri yok.
+# Çıktı __KKB__ / "__KKS__ <rc>" işaretleri arasından alınır; çıkış kodu komutunki.
+# Bağlantı işaretten önce kapanırsa (ör. kk-reboot2 bootloader) 75 döner.
+# G33: cihaz FIN göndermeden sıfırlanırsa bağlantı EOF vermez. Bu yüzden komuttan sonra SESSIZ sn hiç veri gelmezse
+#   çıkılır: komut reboot/kk-reboot2/poweroff içeriyorsa 5 sn ve 75 (bağlantı koptu), aksi hâlde 20 sn ve 76.
+# Çıkış: komut rc / 1 bağlantı yok / 65 imza tutmadı (gönderilmedi) / 64 girdi / 75 bağlantı kapandı / 76 zaman aşımı.
+# Log: /opt/kara-kutu/work/kk-bin-log/kk-bin.log. Değiştirmek bakımcının onayını gerektirir (docs/guvenlik-tasarimi.md).
+# G50 (bakımcı onayı (i), G49 önerisi): ortak kk-bin kilidi (flock -n, work/kk-bin-log/kk-bin.kilit, fd 9); doluysa çıkış 77, hiçbir şey yapılmaz.
+set -u
+H=172.16.42.1; P=2323; SURE=120
+UNAME_RE='^6\.12\.[0-9]+-kk-g[0-9]+$'
+LOG=/opt/kara-kutu/work/kk-bin-log/kk-bin.log; mkdir -p "${LOG%/*}"
+log() { echo "$(date -u '+%F %T.%3N') UTC [kk-anahat] $*" | tee -a "$LOG" >&2; }
+[ "$P" = 2323 ] || exit 70
+[ $# -eq 1 ] || { echo "kullanim: kk-anahat '<komut>'" >&2; exit 64; }
+CMD=$1
+[ ${#CMD} -ge 1 ] && [ ${#CMD} -le 1000 ] || { log "DUR: komut uzunlugu ${#CMD}"; exit 64; }
+[[ $CMD =~ [[:cntrl:]] ]] && { log "DUR: komutta denetim karakteri/satir sonu var"; exit 64; }
+# --- G49 ortak kilit (kural 17'nin mekanik karşılığı): cihaza dokunan kk-bin çağrıları tek tek. ---
+# flock, work/kk-bin-log/kk-bin.kilit üzerinde, fd 9. Bekleme YOK (-n): kilit doluysa hemen 77, cihaz işlemi yapılmaz.
+# Miras: iç içe kk-bin çağrısı üstünün fd 9'unu (aynı açık dosya tanımı) devralır; flock aynı tanımda yeniden başarılı.
+# Ortam değişkeni (KK_KILIT_SAHIBI) yalnız log içindir; mirası açmaz. Kilidi tutan süreç ve fd 9'u devralan çocukları
+# bitince (SIGKILL dahil) çekirdek kilidi bırakır: bayat kilit olmaz (dosya kalır, içeriği yalnız "son sahip" bilgisi).
+KK_KILIT=/opt/kara-kutu/work/kk-bin-log/kk-bin.kilit
+kk_kilit() {
+	local kl=${KK_KILIT%/*}/kk-bin.log ad=${0##*/} t
+	t=$(date -u '+%F %T.%3N')
+	mkdir -p "${KK_KILIT%/*}" || exit 77
+	if [ /proc/$$/fd/9 -ef "$KK_KILIT" ] && flock -n 9; then
+		echo "$t UTC [$ad] kilit: miras (sahip ${KK_KILIT_SAHIBI:-?}; pid $$)" >> "$kl"; return 0
+	fi
+	if exec 9>>"$KK_KILIT" && flock -n 9; then
+		export KK_KILIT_SAHIBI="pid=$$ $ad"
+		printf 'pid=%s betik=%s arg=%.80s bas=%s UTC\n' $$ "$ad" "$*" "$t" > "$KK_KILIT"
+		echo "$t UTC [$ad] kilit: alindi (pid $$)" >> "$kl"; return 0
+	fi
+	echo "$t UTC [$ad] RED: kk-bin kilidi mesgul (son sahip: $(head -c 200 "$KK_KILIT" 2>/dev/null | tr -d '\n')); cihaz islemi YAPILMADI; cikis 77" | tee -a "$kl" >&2
+	exit 77
+}
+kk_kilit "$@"
+# --- G49 ortak kilit sonu ---
+temiz() { tr -d '\r' | LC_ALL=C tr -cd '[:print:]\n'; }
+
+exec 3<>"/dev/tcp/$H/$P" 2>/dev/null || { log "DUR: $H:$P baglanti yok"; exit 1; }
+trap 'exec 3<&- 3>&-' EXIT
+
+# 1) imza: en çok 8 sn, ilk "KK-ANAHAT" satırı
+imza=; son=$((SECONDS + 8))
+while [ $SECONDS -lt $son ]; do
+	l=
+	IFS= read -r -t 2 -u 3 l; st=$?
+	if [ $st -ne 0 ] && [ -z "$l" ]; then [ $st -gt 128 ] && continue; break; fi
+	l=$(printf '%s' "$l" | temiz)
+	case $l in *KK-ANAHAT*) imza=$l; break;; esac
+done
+un=$(printf '%s' "$imza" | sed -n 's/.*KK-ANAHAT G[0-9][0-9]* | uname=\([^ |]*\) |.*/\1/p')
+if [ -z "$un" ] || ! [[ $un =~ $UNAME_RE ]]; then
+	log "DUR: imza tutmadi ($H:$P, satir='${imza:0:120}', uname='$un'); komut GONDERILMEDI"
+	exit 65
+fi
+log "imza OK: $H:$P uname=$un; komut: $CMD"
+
+# 2) komut
+printf 'echo __KKB__; %s; echo __KKS__ $?; exit\n' "$CMD" >&3
+REBOOTLU=0; [[ $CMD =~ (^|[^[:alnum:]_-])(kk-reboot2|reboot|poweroff)([^[:alnum:]_-]|$) ]] && REBOOTLU=1
+SESSIZ=20; [ $REBOOTLU = 1 ] && SESSIZ=5
+ic=0; rc=; son=$((SECONDS + SURE)); veri=$SECONDS
+while [ $SECONDS -lt $son ]; do
+	l=
+	IFS= read -r -t 1 -u 3 l; st=$?
+	if [ $st -ne 0 ] && [ -z "$l" ]; then
+		if [ $st -gt 128 ]; then
+			[ $((SECONDS - veri)) -ge $SESSIZ ] || continue
+			if [ $REBOOTLU = 1 ]; then log "baglanti ${SESSIZ} sn sessiz (reboot komutu; FIN'siz kopma)"; exit 75; fi
+			log "UYARI: ${SESSIZ} sn hic veri yok; cikiliyor"; exit 76
+		fi
+		break
+	fi
+	veri=$SECONDS
+	l=$(printf '%s' "$l" | temiz)
+	if [ $ic = 0 ]; then [ "$l" = __KKB__ ] && ic=1; continue; fi
+	if [[ $l =~ ^__KKS__\ ([0-9]+)$ ]]; then rc=${BASH_REMATCH[1]}; break; fi
+	printf '%s\n' "$l"
+done
+if [ -n "$rc" ]; then log "bitti rc=$rc"; exit "$rc"; fi
+if [ $SECONDS -ge $son ]; then log "UYARI: zaman asimi (${SURE}s)"; exit 76; fi
+log "baglanti isaretten once kapandi (reboot komutu olabilir)"; exit 75

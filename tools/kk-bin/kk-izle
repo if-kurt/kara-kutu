@@ -1,0 +1,58 @@
+#!/bin/bash
+# Kara Kutu kk-bin: P30 durumunu izle. YALNIZ OKUMA (fastboot devices, nc -z, lsusb). G24 izle.sh mantığı.
+#   kk-izle <etiket> <sure_sn 1-900> <fb|23|22|2323|2222|herhangi>
+# Çıkış: 0 fastboot / 3 telnet 23 (kurtarma) / 2 ssh 22 (Debian) / 4 telnet 2323 (ana hat, G32) /
+#        5 ssh 2222 (ana hat Debian, G33) / 9 süre doldu / 64 hatalı girdi.
+# G32: ana hat telnet hedefi (2323) eklendi (bakımcı onayı, Görev 32).
+# G33: ana hat Debian SSH hedefi (2222) eklendi (bakımcı onayı, Görev 33).
+# Değiştirmek bakımcının onayını gerektirir (docs/guvenlik-tasarimi.md).
+# G50 (bakımcı onayı (i), G49 önerisi): ortak kk-bin kilidi (flock -n, work/kk-bin-log/kk-bin.kilit, fd 9); doluysa çıkış 77, hiçbir şey yapılmaz.
+set -u
+SERI=${KK_SERI:?KK_SERI ortam degiskeni (fastboot seri no) gerekli}; H=172.16.42.1
+[ $# -eq 3 ] || { echo "kullanim: kk-izle <etiket> <sure_sn> <fb|23|22|2323|2222|herhangi>" >&2; exit 64; }
+E=$1; SURE=$2; HEDEF=$3
+[[ $E =~ ^[A-Za-z0-9_-]{1,32}$ ]] || { echo "DUR: etiket gecersiz" >&2; exit 64; }
+[[ $SURE =~ ^[0-9]{1,3}$ ]] && [ "$SURE" -ge 1 ] && [ "$SURE" -le 900 ] || { echo "DUR: sure gecersiz" >&2; exit 64; }
+case $HEDEF in fb|23|22|2323|2222|herhangi) ;; *) echo "DUR: hedef gecersiz" >&2; exit 64;; esac
+# --- G49 ortak kilit (kural 17'nin mekanik karşılığı): cihaza dokunan kk-bin çağrıları tek tek. ---
+# flock, work/kk-bin-log/kk-bin.kilit üzerinde, fd 9. Bekleme YOK (-n): kilit doluysa hemen 77, cihaz işlemi yapılmaz.
+# Miras: iç içe kk-bin çağrısı üstünün fd 9'unu (aynı açık dosya tanımı) devralır; flock aynı tanımda yeniden başarılı.
+# Ortam değişkeni (KK_KILIT_SAHIBI) yalnız log içindir; mirası açmaz. Kilidi tutan süreç ve fd 9'u devralan çocukları
+# bitince (SIGKILL dahil) çekirdek kilidi bırakır: bayat kilit olmaz (dosya kalır, içeriği yalnız "son sahip" bilgisi).
+KK_KILIT=/opt/kara-kutu/work/kk-bin-log/kk-bin.kilit
+kk_kilit() {
+	local kl=${KK_KILIT%/*}/kk-bin.log ad=${0##*/} t
+	t=$(date -u '+%F %T.%3N')
+	mkdir -p "${KK_KILIT%/*}" || exit 77
+	if [ /proc/$$/fd/9 -ef "$KK_KILIT" ] && flock -n 9; then
+		echo "$t UTC [$ad] kilit: miras (sahip ${KK_KILIT_SAHIBI:-?}; pid $$)" >> "$kl"; return 0
+	fi
+	if exec 9>>"$KK_KILIT" && flock -n 9; then
+		export KK_KILIT_SAHIBI="pid=$$ $ad"
+		printf 'pid=%s betik=%s arg=%.80s bas=%s UTC\n' $$ "$ad" "$*" "$t" > "$KK_KILIT"
+		echo "$t UTC [$ad] kilit: alindi (pid $$)" >> "$kl"; return 0
+	fi
+	echo "$t UTC [$ad] RED: kk-bin kilidi mesgul (son sahip: $(head -c 200 "$KK_KILIT" 2>/dev/null | tr -d '\n')); cihaz islemi YAPILMADI; cikis 77" | tee -a "$kl" >&2
+	exit 77
+}
+kk_kilit "$@"
+# --- G49 ortak kilit sonu ---
+t0=$(date +%s); son=
+while :; do
+	el=$(( $(date +%s) - t0 ))
+	fb=$(timeout 3 fastboot devices 2>/dev/null | grep -cE "^$SERI[[:space:]]")
+	p23=$(nc -z -w 1 $H 23 2>/dev/null && echo 1 || echo 0)
+	p22=$(nc -z -w 1 $H 22 2>/dev/null && echo 1 || echo 0)
+	p2323=$(nc -z -w 1 $H 2323 2>/dev/null && echo 1 || echo 0)
+	p2222=$(nc -z -w 1 $H 2222 2>/dev/null && echo 1 || echo 0)
+	usb=$(lsusb | grep -oE '(18d1|12d1|1d6b):[0-9a-f]{4}' | sort -u | tr '\n' ',')
+	d="fb=$fb t23=$p23 s22=$p22 a2323=$p2323 d2222=$p2222 usb=$usb"
+	[ "$d" != "$son" ] && { echo "$(date -u '+%T') +${el}s [$E] $d"; son=$d; }
+	case $HEDEF in
+		fb) [ "$fb" = 1 ] && exit 0;; 23) [ $p23 = 1 ] && exit 3;; 22) [ $p22 = 1 ] && exit 2;;
+		2323) [ $p2323 = 1 ] && exit 4;; 2222) [ $p2222 = 1 ] && exit 5;;
+		herhangi) [ "$fb" = 1 ] && exit 0; [ $p23 = 1 ] && exit 3; [ $p22 = 1 ] && exit 2; [ $p2323 = 1 ] && exit 4; [ $p2222 = 1 ] && exit 5;;
+	esac
+	[ $el -ge "$SURE" ] && { echo "$(date -u '+%T') +${el}s [$E] SURE DOLDU"; exit 9; }
+	timeout 2 tail -f /dev/null 9>&-  # G52 S4: timeout kendi surec grubunda; kilit fd 9'u devralmasin (grup SIGKILL'inde <= 2 sn bayat kilit)
+done

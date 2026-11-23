@@ -1,0 +1,91 @@
+#!/bin/bash
+# Kara Kutu kk-bin: eRecovery yuvasındaki v5.1e kurtarma ortamında (telnet 23) PLAN §13.6-B adımları.
+#   kk-kurtarma durum    salt okuma: cmdline nedenleri, misc/rrecord ilk 14 bayt, p43/p40/p24/p26/p8 sha
+#   kk-kurtarma aktar    v5.1 imajı + cihaz/dd-kernel-kurtarma.sh + cihaz/bfr-temizle-g23.sh -> /tmp (nc); üçünün sha'sı denetlenir
+#   kk-kurtarma kernel   /tmp sha'ları yeniden denetlenir, sonra `sh /tmp/dd-kernel-kurtarma.sh /tmp/v51.img` (G23 betiği, değişmedi)
+#   kk-kurtarma bfr      sha denetimi, sonra `sh /tmp/bfr-temizle-g23.sh` (G23 betiği, değişmedi; misc/rrecord'a tek izinli yol)
+#   kk-kurtarma reboot [22|2222]
+#                        `sync` + /data ayır (umount; olmazsa remount,ro; G58; olmazsa sysrq-u, G59) + `reboot -f`, sonra 240 sn SSH bekler: 22 = 4.9 Debian (varsayılan; kernel bölümünde v5.1),
+#                        2222 = ana hat Debian (G57 G-8; kernel bölümünde günlük ana hat; kk-izle çıkışı 5)
+# Sıra: aktar -> kernel -> bfr -> reboot (önce kernel, sonra bayrak). Telnet 23 açık değilse hiçbir şey yapmaz.
+# cihaz/ altındaki iki betik work/g23/geri/'deki onaylı betiklerin bayt bayt kopyası; sha'lar aşağıda sabit.
+# Değiştirmek bakımcının onayını gerektirir.
+# G50 (bakımcı onayı (i), G49 önerisi): ortak kk-bin kilidi (flock -n, work/kk-bin-log/kk-bin.kilit, fd 9); doluysa çıkış 77, hiçbir şey yapılmaz.
+set -u
+KB=/opt/kara-kutu/tools/kk-bin; H=172.16.42.1
+V51=/opt/kara-kutu/work/test2/kk-rescue-kernel-v5.1.img; V51_SHA=d27b3d736ed1110586f948f1c27bc6b21a5ac45ae8ef5894c29e9bba6d65b449
+DDK=$KB/cihaz/dd-kernel-kurtarma.sh; DDK_SHA=3edb7a64742c7fc4f8704f26307ff3da83d5dd25a80ed1c3a7962f7e2b5c171e
+BFR=$KB/cihaz/bfr-temizle-g23.sh; BFR_SHA=c04d821bf6788327c2131903d5066d60923a492795c81bea39813a67364d6f54
+LOG=/opt/kara-kutu/work/kk-bin-log/kk-bin.log; mkdir -p "${LOG%/*}"
+log() { echo "$(date -u '+%F %T.%3N') UTC [kk-kurtarma] $*" | tee -a "$LOG"; }
+tn() { printf '%s; echo __SON__; exit\n' "$1" | timeout "$2" nc $H 23 | tr -d '\r' | LC_ALL=C sed 's/[\x80-\xff]//g; s/^\x1b\[[0-9;?]*[a-zA-Z]//'; }
+# G58: reboot adımının uzak komutu (busybox sh). İşaret "VERI""AYIR=" iki parça: telnet yankısında bitişik görünmez.
+# G59 (G58-K1, tasarım): umount ve remount,ro başarısızsa (v5.1e PID 1 /data'da log fd'si tutar) sync + sysrq-u
+#   (4.9 do_emergency_remount: yalnız blok aygıtlı fs, force=1) -> en çok 3 sn /proc/mounts'ta /data ro beklenir.
+#   sysrq-b KULLANILMAZ (BFR tetikler). /data hâlâ rw ise AYRILAMADI; reboot -f her durumda yapılır.
+AYIR_REBOOT='sync; if grep -q " /data " /proc/mounts; then if umount /data; then echo "VERI""AYIR=ayrildi"; elif mount -o remount,ro /data; then echo "VERI""AYIR=ro"; else sync; echo u > /proc/sysrq-trigger; i=0; while [ $i -lt 3 ] && ! grep -q " /data [^ ]* ro[, ]" /proc/mounts; do sleep 1; i=$((i+1)); done; if grep -q " /data [^ ]* ro[, ]" /proc/mounts; then echo "VERI""AYIR=sysrq-ro"; else echo "VERI""AYIR=AYRILAMADI"; fi; fi; else echo "VERI""AYIR=bagli-degil"; fi; sync; reboot -f'
+[ $# -eq 1 ] || { [ $# -eq 2 ] && [ "$1" = reboot ]; } || { echo "kullanim: kk-kurtarma durum|aktar|kernel|bfr|reboot [22|2222]" >&2; exit 64; }
+case $1 in durum|aktar|kernel|bfr|reboot) ;; *) echo "DUR: adim gecersiz" >&2; exit 64;; esac
+DH=${2:-22}; case $DH in 22|2222) ;; *) echo "DUR: reboot hedefi 22|2222" >&2; exit 64;; esac
+# --- G49 ortak kilit (kural 17'nin mekanik karşılığı): cihaza dokunan kk-bin çağrıları tek tek. ---
+# flock, work/kk-bin-log/kk-bin.kilit üzerinde, fd 9. Bekleme YOK (-n): kilit doluysa hemen 77, cihaz işlemi yapılmaz.
+# Miras: iç içe kk-bin çağrısı üstünün fd 9'unu (aynı açık dosya tanımı) devralır; flock aynı tanımda yeniden başarılı.
+# Ortam değişkeni (KK_KILIT_SAHIBI) yalnız log içindir; mirası açmaz. Kilidi tutan süreç ve fd 9'u devralan çocukları
+# bitince (SIGKILL dahil) çekirdek kilidi bırakır: bayat kilit olmaz (dosya kalır, içeriği yalnız "son sahip" bilgisi).
+KK_KILIT=/opt/kara-kutu/work/kk-bin-log/kk-bin.kilit
+kk_kilit() {
+	local kl=${KK_KILIT%/*}/kk-bin.log ad=${0##*/} t
+	t=$(date -u '+%F %T.%3N')
+	mkdir -p "${KK_KILIT%/*}" || exit 77
+	if [ /proc/$$/fd/9 -ef "$KK_KILIT" ] && flock -n 9; then
+		echo "$t UTC [$ad] kilit: miras (sahip ${KK_KILIT_SAHIBI:-?}; pid $$)" >> "$kl"; return 0
+	fi
+	if exec 9>>"$KK_KILIT" && flock -n 9; then
+		export KK_KILIT_SAHIBI="pid=$$ $ad"
+		printf 'pid=%s betik=%s arg=%.80s bas=%s UTC\n' $$ "$ad" "$*" "$t" > "$KK_KILIT"
+		echo "$t UTC [$ad] kilit: alindi (pid $$)" >> "$kl"; return 0
+	fi
+	echo "$t UTC [$ad] RED: kk-bin kilidi mesgul (son sahip: $(head -c 200 "$KK_KILIT" 2>/dev/null | tr -d '\n')); cihaz islemi YAPILMADI; cikis 77" | tee -a "$kl" >&2
+	exit 77
+}
+kk_kilit "$@"
+# --- G49 ortak kilit sonu ---
+nc -z -w 2 $H 23 2>/dev/null || { log "DUR: kurtarma ortami (telnet 23) yok"; exit 1; }
+yerel() { [ "$(sha256sum "$1" | cut -c1-64)" = "$2" ] || { log "DUR: yerel sha tutmuyor: $1"; exit 65; }; }
+uzak() { # uzak <sha> <yol> ... : cihazdaki /tmp dosyalarının sha'ları beklenenle aynı mı
+	local cikti; cikti=$(tn "sha256sum $(for ((i=2; i<=$#; i+=2)); do printf '%s ' "${!i}"; done)" 60 | grep -E '^[0-9a-f]{64}  /tmp/')
+	while [ $# -ge 2 ]; do
+		echo "$cikti" | grep -qx "$1  $2" || { log "DUR: cihazda $2 sha'si beklenen degil"; exit 66; }
+		shift 2
+	done
+}
+case $1 in
+durum)
+	tn 'date; uname -r; cat /proc/cmdline | tr " " "\n" | grep -E "reboot_reason|normal_reset_type|exception|keypoint|enter_erecovery|bootmode"; echo "misc14=$(dd if=/dev/mmcblk0p24 bs=14 count=1 2>/dev/null)"; echo "rrec14=$(dd if=/dev/mmcblk0p26 bs=14 count=1 2>/dev/null)"; for p in 43 40 24 26 8; do echo "p$p $(grep PARTNAME /sys/class/block/mmcblk0p$p/uevent) $(dd if=/dev/mmcblk0p$p bs=4M 2>/dev/null | sha256sum | cut -c1-64)"; done' 90 | tee -a "$LOG";;
+aktar)
+	yerel "$V51" $V51_SHA; yerel "$DDK" $DDK_SHA; yerel "$BFR" $BFR_SHA
+	for x in "$V51:/tmp/v51.img:5555" "$DDK:/tmp/dd-kernel-kurtarma.sh:5556" "$BFR:/tmp/bfr-temizle-g23.sh:5557"; do
+		f=${x%%:*}; r=${x#*:}; d=${r%%:*}; p=${r##*:}
+		tn "(nc -l -p $p > $d &); sleep 1" 15 >/dev/null
+		timeout 60 nc -N -w 5 $H "$p" < "$f"; log "gonderildi $f -> $d rc=$?"
+	done
+	timeout 3 tail -f /dev/null 9>&-  # G53: timeout kendi surec grubunda; kilit fd 9'u devralmasin (grup SIGKILL'inde <= 3 sn bayat kilit)
+	uzak $V51_SHA /tmp/v51.img $DDK_SHA /tmp/dd-kernel-kurtarma.sh $BFR_SHA /tmp/bfr-temizle-g23.sh
+	log "aktarim OK: uc dosyanin sha'si cihazda dogru";;
+kernel)
+	uzak $V51_SHA /tmp/v51.img $DDK_SHA /tmp/dd-kernel-kurtarma.sh
+	log "sh /tmp/dd-kernel-kurtarma.sh /tmp/v51.img"
+	tn 'sh /tmp/dd-kernel-kurtarma.sh /tmp/v51.img; echo "betik cikis=$?"' 120 | sed -n '/^hedef\|^dd\|^SONRA\|^kernel\|^DUR\|^UYARI\|betik cikis\|records\|bytes/p' | tee -a "$LOG" | tee /dev/stderr | grep -q '^kernel = v5.1: OK' \
+		&& log "kernel = v5.1 OK" || { log "UYARI: kernel betigi OK vermedi"; exit 2; };;
+bfr)
+	uzak $BFR_SHA /tmp/bfr-temizle-g23.sh
+	log "sh /tmp/bfr-temizle-g23.sh"
+	tn 'sh /tmp/bfr-temizle-g23.sh > /tmp/kk-temizle.txt 2>&1; echo "betik cikis=$?"; grep -E "^(ONCE|SONRA|misc|rrecord|DUR|UYARI)" /tmp/kk-temizle.txt' 90 | sed -n '/betik cikis\|^ONCE\|^SONRA\|^misc\|^rrecord\|^DUR\|^UYARI/p' | tee -a "$LOG";;
+reboot)
+	# G58 (tasarım + bakımcı onayı, 2026-11-22): v5.1e p68'i /data'ya rw bağlıyor; ayırmadan reboot -f -> needs_recovery ->
+	# ana hatta kk-alan DUR. Önce sync + /data ayır (umount; olmazsa remount,ro); ayrılamasa da reboot yapılır, durum log'a.
+	log "kurtarma: sync + /data ayir (umount; olmazsa remount,ro; olmazsa sysrq-u <= 3 sn) + reboot -f (beklenen: ssh $DH)"
+	VA=$(tn "$AYIR_REBOOT" 40 2>/dev/null | grep -o 'VERIAYIR=[A-Za-z-]*' | head -n 1)
+	log "kurtarma: /data ${VA:-VERIAYIR=okunamadi} (sonuc ne olursa olsun reboot -f gonderildi)"
+	"$KB/kk-izle" donus 240 "$DH" 2>&1 | tee -a "$LOG"; R=${PIPESTATUS[0]}; log "izle cikis=$R (2 ssh 22, 5 ssh 2222, 9 sure doldu)"; exit "$R";;
+esac

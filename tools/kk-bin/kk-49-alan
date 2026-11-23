@@ -1,0 +1,410 @@
+#!/bin/bash
+# Kara Kutu kk-bin (G47, eMMC E1/E3; bakımcı onaylı; G48 b2 + prova + nokta kaydı, bakımcı onaylı): 4.9 Debian'da kkdata
+# (p68 userdata) içinde ana hat yazma penceresi için 1 GiB, fiziksel ardışık, immutable alan dosyası (work/g46/emmc/PLAN-alan-4.9.md §2).
+#   kk-49-alan denetle <cikti>   yalnız okuma: uname, p68 (başlangıç/boy/ad/PARTUUID), bağlama, boş alan, araçlar
+#   kk-49-alan prova <cikti>     G48 (a): denetle + aynı dizinde 512 MiB prova.img: fallocate -> collapse-range 128 MiB ->
+#                                truncate 256 MiB; her adımda sync + FIEMAP; tutulan aralığın fiziksel haritası önce = sonra;
+#                                sonra prova.img silinir, açılan dizinler kaldırılır. Tek beklenmeyen sonuç -> DUR (trap siler).
+#   kk-49-alan olustur <cikti>   denetle + oluştur: G47 ÖNERİSİ (b2): 6 GiB fallocate -> FIEMAP'te mantıksal ve fiziksel ardışık
+#                                ilk 1 GiB alt aralık (yoksa sil, dur) -> collapse-range (öndeki kısım) + truncate 1 GiB ->
+#                                FIEMAP ardışık, ilk fiziksel = seçilen ->
+#                                sıfır yazımı (dd, unwritten -> written) -> mke2fs -E nodiscard (UNIX_IO_NOZEROOUT=1) ->
+#                                chattr +i (e2fsprogs) + lsattr -> FIEMAP her adımda aynı -> sha'lar, mutlak sektör penceresi ->
+#                                G48 (b): 6 noktanın (0, 128, 384, 640, 896 MiB, son 4 KiB) 4 KiB sha256'sı, dosyadan ve p68'den
+#                                ham (iflag=direct) okunur, ikisi aynı olmalı; en az 2 nokta sıfır dışı; boş alan önce/sonra.
+#   kk-49-alan oku <cikti>       G48 E4 ÖNERİSİ: denetle + YALNIZ OKUMA çapraz denetim (E2/E4 öncesi ve sonrası): alan.img
+#                                var, immutable, 1 GiB, FIEMAP ardışık (W_BAS), fiemap sha; 6 nokta + E4 hedef bölgesi
+#                                (dosya içi 1022 MiB, 1 MiB) dosyadan ve p68'den ham; iç fs e2fsck -fn, dumpe2fs -h,
+#                                debugfs (-w YOK) testb ile hedef bölgenin iç fs'te boş olduğu. Hiçbir şey yazmaz/silmez.
+#                                G49: tam dosya sha256 ve üç dilim [0,1022) [1022,1023) [1023,1024) MiB (DILIM satırları).
+#                                G50 E5: iç fs'te /kk-e5 varsa E5 sonrası denetimleri (YALNIZ OKUMA, bağlama yok, debugfs -w yok):
+#                                e2fsck -fn rc 0; dumpe2fs temiz/kurtarma yok/bağlama 1; debugfs cat ile test dosyası sha + boy;
+#                                dosya blokları E4 diliminde/6 noktada değil; E4 dilimi desen (değiştiyse değişen her blok iç fs'te
+#                                kullanımda); 4 yedek süper blok (128/384/640/896 MiB) 1.1 kaydı; FIEMAP sha E4 sonrası kaydı.
+#                                Satırlar "E5 ...", hüküm "E5 HUKUM gecti|KALDI:<nedenler>"; /kk-e5 yoksa "E5 yok". DUR yazmaz.
+#                                G52 E6-0 ÖNERİSİ (ONAY BEKLİYOR): iç fs'te /kk/durum/sayac varsa (E6 başladı) E5 hükmü atlanır
+#                                (iç fs her oturumda yazılıyor) ve E6 denetimleri yapılır (YALNIZ OKUMA, debugfs -c, bağlama yok):
+#                                değişmezler (iç fs adı/UUID, özellik listesi, FIEMAP sha) + sayaç + kirli/temiz ayrımı (kirliyse
+#                                e2fsck -fn yalnız bilgi: günlük oynatılmadan -n yanlış alarm verir) + /journal listesi.
+#                                Hüküm "E6 HUKUM temiz|kirli|KALDI:<nedenler>". DUR yazmaz.
+# Dokunulan tek şey <kkdata>/kk/anahat/alan.img (ve gerekirse kk/, kk/anahat/ dizinleri). Başka dosya yazılmaz; FIEMAP
+# dökümleri ve log /run'da (tmpfs). Başarısızlıkta trap: chattr -i (varsa) + rm + bizim açtığımız boş dizinler rmdir.
+# Neden büyük dosya (G47, work/g47/emmc/PLAN-alan-ek-g47.md): 4.9 mballoc büyük dosyanın İLK parçasını dizin/inode
+#   grubundan değil s_mb_last_group'tan (bağlamadan beri son akış tahsisi) başlatır; 8 MiB'lık parçalar yalnız arkadaki
+#   2048 blok boşsa ardışık uzar, yedek süperblok/flex meta verisi/Debian verisinde kopar. 1 GiB'lık tek deneme bu yüzden
+#   başlangıç noktasına bağlı (cihazda iki deneme de kopuk). 4 GiB yetiyor (4.9 modeli, her başlangıç grubunda
+#   ardışık 1 GiB alt aralık; en büyük ofset 2,91 GiB); pay için 6 GiB; collapse/truncate yalnız mantıksal kaydırır, fiziksel blokları taşımaz.
+# Neden UNIX_IO_NOZEROOUT=1: mke2fs 1.47 normal dosyada sıfırlamayı fallocate(ZERO_RANGE) ile yapar -> extent'ler
+#   "unwritten" olur, 4.9 o bölgeleri sıfır görür (G47 yerel deney: 64 MiB'da 5 unwritten extent). Değişken bunu kapatır.
+# Öz doğrulama: bu dosyanın sha256'sı SHA256SUMS'taki satırla aynı değilse çalışmaz. Hedef uname ^4\.9\. olmalı.
+# Cihaz betiği systemd-run birimi (SSH koparsa da sürer), RuntimeMaxSec=900. Bekleme 90 x 10 sn (kural 16).
+# Çıkış: 0 tamam / 3 dur (ölçüt tutmadı; olustur'da dosya geri alındı) / 1 bağlantı / 64 girdi / 65 doğrulama.
+# Değiştirmek bakımcının onayını gerektirir (docs/guvenlik-tasarimi.md kural 12). Log: work/kk-bin-log/kk-bin.log.
+# G50 (bakımcı onayı (i), G49 önerisi): ortak kk-bin kilidi (flock -n, work/kk-bin-log/kk-bin.kilit, fd 9); doluysa çıkış 77, hiçbir şey yapılmaz.
+set -u
+KB=/opt/kara-kutu/tools/kk-bin; ME=$(realpath -- "$0")
+LOG=/opt/kara-kutu/work/kk-bin-log/kk-bin.log; mkdir -p "${LOG%/*}"
+log() { echo "$(date -u '+%F %T.%3N') UTC [kk-49-alan] $*" | tee -a "$LOG" >&2; }
+[ $# -eq 2 ] || { echo "kullanim: kk-49-alan denetle|prova|olustur|oku <cikti-dosyasi>" >&2; exit 64; }
+MOD=$1; case $MOD in denetle|prova|olustur|oku) ;; *) echo "kullanim: kk-49-alan denetle|prova|olustur|oku <cikti-dosyasi>" >&2; exit 64;; esac
+OUT=$(realpath -m -- "$2")
+case $OUT in /opt/kara-kutu/work/*) ;; *) log "DUR: cikti work/ disinda: $OUT"; exit 64;; esac
+[ -e "$OUT" ] && { log "DUR: cikti zaten var: $OUT"; exit 64; }
+[ -d "${OUT%/*}" ] || { log "DUR: dizin yok: ${OUT%/*}"; exit 64; }
+want=$(awk '$2=="kk-49-alan"{print $1}' "$KB/SHA256SUMS"); have=$(sha256sum "$ME" | cut -c1-64)
+[ -n "$want" ] && [ "$want" = "$have" ] || { log "DUR: betik sha256 SHA256SUMS ile tutmadi ($have)"; exit 65; }
+CIHAZ=$(sed -n '/^#--- CIHAZ BASI ---$/,/^#--- CIHAZ SONU ---$/p' "$ME")
+CSHA=$(printf '%s\n' "$CIHAZ" | sha256sum | cut -c1-64)
+SSH=(ssh -o UserKnownHostsFile=$KB/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=10
+     -o ServerAliveInterval=5 -o ServerAliveCountMax=3 ${KK_KULLANICI:-kk}@172.16.42.1)
+r() { timeout 60 "${SSH[@]}" "$1"; }
+# --- G49 ortak kilit (kural 17'nin mekanik karşılığı): cihaza dokunan kk-bin çağrıları tek tek. ---
+# flock, work/kk-bin-log/kk-bin.kilit üzerinde, fd 9. Bekleme YOK (-n): kilit doluysa hemen 77, cihaz işlemi yapılmaz.
+# Miras: iç içe kk-bin çağrısı üstünün fd 9'unu (aynı açık dosya tanımı) devralır; flock aynı tanımda yeniden başarılı.
+# Ortam değişkeni (KK_KILIT_SAHIBI) yalnız log içindir; mirası açmaz. Kilidi tutan süreç ve fd 9'u devralan çocukları
+# bitince (SIGKILL dahil) çekirdek kilidi bırakır: bayat kilit olmaz (dosya kalır, içeriği yalnız "son sahip" bilgisi).
+KK_KILIT=/opt/kara-kutu/work/kk-bin-log/kk-bin.kilit
+kk_kilit() {
+	local kl=${KK_KILIT%/*}/kk-bin.log ad=${0##*/} t
+	t=$(date -u '+%F %T.%3N')
+	mkdir -p "${KK_KILIT%/*}" || exit 77
+	if [ /proc/$$/fd/9 -ef "$KK_KILIT" ] && flock -n 9; then
+		echo "$t UTC [$ad] kilit: miras (sahip ${KK_KILIT_SAHIBI:-?}; pid $$)" >> "$kl"; return 0
+	fi
+	if exec 9>>"$KK_KILIT" && flock -n 9; then
+		export KK_KILIT_SAHIBI="pid=$$ $ad"
+		printf 'pid=%s betik=%s arg=%.80s bas=%s UTC\n' $$ "$ad" "$*" "$t" > "$KK_KILIT"
+		echo "$t UTC [$ad] kilit: alindi (pid $$)" >> "$kl"; return 0
+	fi
+	echo "$t UTC [$ad] RED: kk-bin kilidi mesgul (son sahip: $(head -c 200 "$KK_KILIT" 2>/dev/null | tr -d '\n')); cihaz islemi YAPILMADI; cikis 77" | tee -a "$kl" >&2
+	exit 77
+}
+kk_kilit "$@"
+# --- G49 ortak kilit sonu ---
+
+un=$(r 'uname -r' 2>/dev/null | tr -d '\r')
+[[ $un =~ ^4\.9\. ]] || { log "DUR: uname tutmadi ('${un:0:60}'); hicbir sey yapilmadi"; exit 65; }
+onceki=$(r 'systemctl is-active kk-49-alan.service' 2>/dev/null | tr -d '\r\n')
+[ "$onceki" = inactive ] || { log "DUR: onceki birim durumu: '$onceki'"; exit 65; }
+uz=$(printf '%s\n' "$CIHAZ" | timeout 30 "${SSH[@]}" 'sudo -n tee /run/kk-49-alan.sh >/dev/null && sudo -n sh -n /run/kk-49-alan.sh && sha256sum /run/kk-49-alan.sh' 2>&1 | cut -c1-64)
+[ "$uz" = "$CSHA" ] || { log "DUR: cihaz betigi sha tutmadi (yerel $CSHA, uzak '${uz:0:64}')"; exit 65; }
+log "uname OK $un; cihaz betigi /run/kk-49-alan.sh sha $CSHA; mod=$MOD -> $OUT"
+r "sudo -n systemd-run --unit=kk-49-alan --collect -p RuntimeMaxSec=900 /bin/sh /run/kk-49-alan.sh $MOD" >/dev/null 2>&1 \
+	|| { log "DUR: systemd-run basarisiz"; exit 3; }
+
+# Bekleme: sleep + kesin üst süre (90 x 10 sn); durum birim adıyla sorulur (öz eşleşme yok; kural 16).
+st=active; i=0
+while [ $i -lt 90 ]; do
+	sleep 10; i=$((i+1))
+	st=$(r 'systemctl is-active kk-49-alan.service' 2>/dev/null | tr -d '\r'); st=${st:-baglanti-yok}
+	case $st in active|activating|baglanti-yok) ;; *) break;; esac
+done
+log "birim: $st (${i}0 sn)"
+{ r 'cat /run/kk-49-alan.log'
+  for f in 0a 0b 1 2 3 p0 p1 p2 o1; do echo "=== fiemap-$f"; r "cat /run/kk-49-alan-fiemap-$f.txt 2>/dev/null"; done; } > "$OUT" 2>&1
+grep -E 'DUR|SONUC|KAYIT|NOKTA|PROVA|OKU|BOLGE|DILIM|E5|E6|geri:' "$OUT" | cut -c1-240 >&2
+if grep -q ' SONUC tamam' "$OUT"; then log "TAMAM: mod=$MOD; $(grep -m1 ' SONUC tamam' "$OUT" | cut -c1-200)"; exit 0; fi
+log "UYARI: mod=$MOD tamamlanmadi (birim $st); cikti $OUT"; exit 3
+
+#--- CIHAZ BASI ---
+# /run/kk-49-alan.sh <denetle|prova|olustur|oku>  (root, systemd-run birimi). KK_* değişkenleri YALNIZ yerel sınama içindir.
+set -u
+MOD=${1:-denetle}
+case $MOD in denetle|prova|olustur|oku) ;; *) echo "mod gecersiz" >&2; exit 64;; esac
+L=${KK_LOG:-/run/kk-49-alan.log}; FM=${KK_FM:-/run/kk-49-alan-fiemap}
+BOY=${KK_BOY:-1073741824}; BLK=$((BOY / 4096))
+BUYUK=${KK_BUYUK:-6442450944}; BBLK=$((BUYUK / 4096))
+# G48 prova: 512 MiB dosya, önden 128 MiB collapse, 256 MiB'a truncate (tutulan aralık: özgün mantıksal [128, 384) MiB)
+PBOY=${KK_PBOY:-536870912}; PC=${KK_PC:-134217728}; PT=${KK_PT:-268435456}
+P=${KK_BOLUM:-/dev/mmcblk0p68}; PS=${KK_PSYS:-/sys/class/block/mmcblk0p68}
+UD_BAS=${KK_UD_BAS:-16826368}; UD_BOY=${KK_UD_BOY:-227450880}; PUUID=${KK_PUUID:-@@GUID@@}
+REL=kk/anahat/alan.img
+CHATTR=${KK_CHATTR:-/usr/bin/chattr}; LSATTR=${KK_LSATTR:-/usr/bin/lsattr}; BLKID=${KK_BLKID:-blkid}
+: > "$L"; rm -f "$FM"-*.txt
+log() { echo "$(date -u '+%T') $*" >> "$L"; }
+dur() { log "DUR: $*"; exit 3; }
+OLUSAN=0; ACILAN=""; BITTI=0
+temizle() {
+	rc=$?
+	[ $BITTI = 1 ] && return
+	if [ $OLUSAN = 1 ] && [ -e "$F" ]; then
+		$LSATTR -d "$F" 2>/dev/null | cut -d' ' -f1 | grep -q i && $CHATTR -i "$F"
+		rm -f "$F"; sync; log "geri: $F silindi (rc=$rc)"
+	fi
+	for d in $ACILAN; do rmdir "$d" 2>/dev/null && log "geri: bos dizin $d kaldirildi"; done
+	log "SONUC dur rc=$rc"
+}
+trap temizle EXIT; trap 'exit 4' INT TERM HUP
+
+# ardisik <fiemap-dosyasi>: mantıksal ve fiziksel kesintisiz ardışıklık (ext4 extent <= 32768 blok; tek extent beklenmez)
+ardisik() {
+	awk -v want=$BLK '
+	/^File size of .* \([0-9]+ blocks of 4096 bytes\)/ { hb = 1 }
+	/^ *[0-9]+:/ { s = $0; gsub(/\.\./, " ", s); gsub(/:/, " ", s); split(s, a, " ")
+		ls = a[2]; le = a[3]; ps = a[4]; pe = a[5]; ln = a[6]
+		if (ext == 0) { ilk = ps; if (ls != 0) bad = bad "+ilk-mantiksal" }
+		else { if (ls != ple + 1) bad = bad "+mantiksal-bosluk@" ext; if (ps != ppe + 1) bad = bad "+fiziksel-bosluk@" ext }
+		if (le - ls + 1 != ln || pe - ps + 1 != ln) bad = bad "+uzunluk@" ext
+		if (s ~ /unwritten/) uw++
+		ple = le; ppe = pe; top += ln; ext++ }
+	END { if (!hb) bad = bad "+baslik"; if (top != want) bad = bad "+toplam"; if (ext == 0) bad = bad "+extent-yok"
+		printf "tamam=%d ilk=%s son=%s ext=%d unwritten=%d toplam=%d neden=%s\n", (bad == ""), ilk, ppe, ext, uw + 0, top, (bad == "" ? "-" : bad) }' "$1"
+}
+fiemap() { filefrag -v -e "$F" > "$FM-$1.txt" 2>&1; ardisik "$FM-$1.txt"; }
+alan() { echo "$1" | tr ' ' '\n' | sed -n "s/^$2=//p"; }
+# sec <fiemap-dosyasi>: büyük dosyada mantıksal VE fiziksel kesintisiz İLK >= BLK blokluk koşu (G47). Delik/eksik yok.
+sec() {
+	awk -v want=$BLK -v top0=$BBLK '
+	/^File size of .* \([0-9]+ blocks of 4096 bytes\)/ { hb = 1 }
+	/^ *[0-9]+:/ { s = $0; gsub(/\.\./, " ", s); gsub(/:/, " ", s); split(s, a, " ")
+		ls = a[2]; le = a[3]; ps = a[4]; pe = a[5]; ln = a[6]
+		if (le - ls + 1 != ln || pe - ps + 1 != ln) bad = bad "+uzunluk@" ext
+		if (ext == 0 && ls != 0) bad = bad "+ilk-mantiksal"
+		if (ext > 0 && ls != ple + 1) bad = bad "+mantiksal-bosluk@" ext
+		if (ext > 0 && ls == ple + 1 && ps == ppe + 1) kn += ln; else { kl = ls; kp = ps; kn = ln }
+		if (kn >= want && L == "") { L = kl; P = kp }
+		if (s !~ /unwritten/) yw++
+		ple = le; ppe = pe; top += ln; ext++ }
+	END { if (!hb) bad = bad "+baslik"; if (top != top0) bad = bad "+toplam"; if (yw) bad = bad "+yazilmis-extent"
+		if (L == "") bad = bad "+ardisik-1GiB-yok"
+		printf "tamam=%d L=%s P=%s ext=%d toplam=%d neden=%s\n", (bad == ""), (L == "" ? "-" : L), (P == "" ? "-" : P), ext, top, (bad == "" ? "-" : bad) }' "$1"
+}
+# harita <fiemap-dosyasi> <a> <b>: mantıksal [a, b) blok aralığının fiziksel haritası, a'ya göre göreli ve birleştirilmiş
+# ("göreli fiziksel uzunluk" satırları + "toplam N" + "unwritten-disi M"). G48 prova karşılaştırması bununla yapılır.
+harita() {
+	awk -v a=$2 -v b=$3 '
+	/^ *[0-9]+:/ { s = $0; gsub(/\.\./, " ", s); gsub(/:/, " ", s); split(s, x, " "); ls = x[2]; le = x[3]; ps = x[4]
+		lo = (ls > a) ? ls : a; hi = (le + 1 < b) ? le + 1 : b
+		if (lo < hi) { p = ps + lo - ls; r = lo - a; n = hi - lo; top += n; if (s !~ /unwritten/) yw += n
+			if (c && r == pr + pn && p == pp + pn) pn += n; else { if (c) print pr, pp, pn; pr = r; pp = p; pn = n; c++ } } }
+	END { if (c) print pr, pp, pn; print "toplam", top + 0; print "unwritten-disi", yw + 0 }' "$1"
+}
+
+# --- denetim (iki modda da; yalnız okuma) ---
+log "basladi mod=$MOD uname=$(uname -r) up=$(cut -d' ' -f1 /proc/uptime)"
+case "$(uname -r)" in 4.9.*) ;; *) [ -n "${KK_LOG:-}" ] || dur "uname 4.9 degil";; esac
+pb=$(cat $PS/start); pz=$(cat $PS/size); pn=$(sed -n 's/^PARTNAME=//p' $PS/uevent)
+pu=$($BLKID -p -s PART_ENTRY_UUID -o value $P 2>/dev/null)
+log "p68: start=$pb size=$pz ad=$pn partuuid=$pu"
+[ "$pb" = "$UD_BAS" ] && [ "$pz" = "$UD_BOY" ] && [ "$pn" = userdata ] && [ "$pu" = "$PUUID" ] || dur "p68 beklenen degil (start $UD_BAS size $UD_BOY ad userdata partuuid $PUUID)"
+MNT=${KK_MNT:-$(findmnt -n -r -o TARGET,FSROOT -S $P | awk '$2=="/"{print $1; exit}')}
+[ -n "$MNT" ] || dur "p68 kokuyle (FSROOT /) bagli degil"
+mo=$(findmnt -n -r -o FSTYPE,OPTIONS -T "$MNT" | head -1)
+log "kkdata bagli: $MNT ($mo); tum bagli yerleri: $(findmnt -n -r -o TARGET,FSROOT -S $P | tr '\n' ';')"
+case "$mo" in ext4\ *rw,*|ext4\ rw*) ;; *) [ -n "${KK_LOG:-}" ] || dur "kkdata ext4 rw degil";; esac
+case "$mo" in *data=journal*) dur "kkdata data=journal ile bagli (plan §3)";; esac
+F=$MNT/$REL; [ "$MNT" = / ] && F=/$REL
+DIZ=${F%/alan.img}
+bos=$(df -B1 --output=avail "$MNT" | tail -1 | tr -d ' ')
+log "dosya yolu $F; bos alan $bos B"
+[ $MOD = oku ] || [ "$bos" -ge $((2 * BUYUK)) ] || dur "bos alan < 2 x $BUYUK"
+for t in fallocate filefrag mke2fs sha256sum dd e2fsck dumpe2fs truncate; do command -v $t >/dev/null || dur "arac yok: $t"; done
+fallocate --help 2>&1 | grep -q -- '--collapse-range' || dur "fallocate --collapse-range yok"
+pk=$(dpkg -S /usr/bin/chattr /usr/bin/lsattr 2>/dev/null | cut -d: -f1 | sort -u | tr '\n' ' ')
+log "araclar: chattr/lsattr paketi '$pk'; $(mke2fs -V 2>&1 | head -1); mke2fs.conf sha $(sha256sum /etc/mke2fs.conf 2>/dev/null | cut -c1-16)"
+[ "$pk" = "e2fsprogs " ] || dur "chattr/lsattr e2fsprogs'tan degil"
+log "zamanlayicilar: fstrim.timer=$(systemctl is-enabled fstrim.timer 2>&1) e2scrub_all.timer=$(systemctl is-enabled e2scrub_all.timer 2>&1)"
+log "p68 ust bilgi: $(dumpe2fs -h $P 2>/dev/null | grep -E '^(Filesystem state|Filesystem features|Block size|Block count|Free blocks|Flex block group size):' | sed 's/  */ /g' | tr '\n' ';')"
+if [ -e "$F" ]; then log "mevcut: $(ls -l "$F") attr=$($LSATTR -d "$F" 2>&1)"; [ $MOD = olustur ] && { BITTI=1; dur "$F zaten var; dokunulmadi"; }; fi
+if [ $MOD = denetle ]; then BITTI=1; log "SONUC tamam mod=denetle dosya=$F bos=$bos"; exit 0; fi
+
+# --- G48 E4 önerisi: oku (YALNIZ OKUMA; OLUSAN hiç 1 olmaz -> trap dosyaya dokunmaz; mkdir/fallocate/chattr yok) ---
+# Hedef bölge (E4 ham yazma önerisi): dosya içi blok 261632..261887 (1022 MiB'tan 1 MiB); 6 noktayla kesişmez.
+if [ $MOD = oku ]; then
+	HB=${KK_HB:-261632}; HN=${KK_HN:-256}	# OLUSAN=0 kalır: trap yalnız "SONUC dur" yazar, dosyaya dokunmaz
+	[ -f "$F" ] || dur "oku: $F yok"
+	at=$($LSATTR -d "$F" 2>&1 | cut -d' ' -f1); log "OKU dosya=$F inode=$(stat -c %i "$F") boy=$(stat -c %s "$F") lsattr=$at"
+	[ "$(stat -c %s "$F")" = "$BOY" ] || dur "oku: boy $BOY degil"
+	case "$at" in *i*) ;; *) dur "oku: immutable degil";; esac
+	so=$(fiemap o1); ilk=$(alan "$so" ilk); wb=$((UD_BAS + ilk * 8))
+	log "OKU fiemap: $so W_BAS=$wb fiemap_sha256=$(sha256sum "$FM-o1.txt" | cut -c1-64)"
+	[ "$(alan "$so" tamam)" = 1 ] && [ "$(alan "$so" unwritten)" = 0 ] || dur "oku: FIEMAP ardisik/written degil"
+	NK=
+	for o in 0 134217728 402653184 671088640 939524096 $((BOY - 4096)); do
+		h=$(dd if="$F" bs=4096 skip=$((o / 4096)) count=1 iflag=direct 2>/dev/null | sha256sum | cut -c1-64)
+		if [ -b "$P" ]; then r=$(dd if="$P" bs=4096 skip=$((ilk + o / 4096)) count=1 iflag=direct 2>/dev/null | sha256sum | cut -c1-64); hd=ayni
+		else [ -n "${KK_LOG:-}" ] || dur "$P blok aygiti degil"; r=$h; hd=yerel-atlandi; fi
+		[ "$h" = "$r" ] || dur "oku: nokta $o dosya ($h) ve p68 ham ($r) farkli"
+		NK="$NK $h"
+		log "NOKTA ofs=$o mib=$((o / 1048576)) sektor=$((wb + o / 512)) sha256=$h ham_p68=$hd"
+	done
+	h=$(dd if="$F" bs=4096 skip=$HB count=$HN iflag=direct 2>/dev/null | sha256sum | cut -c1-64)
+	if [ -b "$P" ]; then r=$(dd if="$P" bs=4096 skip=$((ilk + HB)) count=$HN iflag=direct 2>/dev/null | sha256sum | cut -c1-64); else r=$h; fi
+	[ "$h" = "$r" ] || dur "oku: hedef bolge dosya ($h) ve p68 ham ($r) farkli"
+	log "BOLGE blok=$HB say=$HN sektor=$((wb + HB * 8)) sha256=$h ilk512=$(dd if="$F" bs=512 skip=$((HB * 8)) count=1 2>/dev/null | tr -cd '[:print:]' | cut -c1-48)"
+	# G49: tam dosya ve üç dilim (iflag=direct): [0, HB), [HB, HB+HN), [HB+HN, BLK) blok; E4 öncesi/sonrası karşılaştırma için
+	da=$(dd if="$F" bs=4096 count=$HB iflag=direct 2>/dev/null | sha256sum | cut -c1-64)
+	db=$(dd if="$F" bs=4096 skip=$HB count=$HN iflag=direct 2>/dev/null | sha256sum | cut -c1-64)
+	dc=$(dd if="$F" bs=4096 skip=$((HB + HN)) count=$((BLK - HB - HN)) iflag=direct 2>/dev/null | sha256sum | cut -c1-64)
+	dt=$(dd if="$F" bs=4096 count=$BLK iflag=direct 2>/dev/null | sha256sum | cut -c1-64)
+	[ "$db" = "$h" ] || dur "oku: orta dilim ($db) BOLGE ($h) ile ayni degil"
+	log "DILIM a=[0,$HB) sha256=$da"
+	log "DILIM b=[$HB,$((HB + HN))) sha256=$db"
+	log "DILIM c=[$((HB + HN)),$BLK) sha256=$dc"
+	log "DILIM tam=[0,$BLK) sha256=$dt"
+	er=$(e2fsck -fn "$F" > "$L.e2fsck" 2>&1; echo $?)
+	log "OKU ic fs e2fsck -fn: rc=$er $(tail -1 "$L.e2fsck")"
+	log "OKU ic fs: $(dumpe2fs -h "$F" 2>/dev/null | grep -E '^(Filesystem volume name|Filesystem state|Filesystem features):' | sed 's/  */ /g' | tr '\n' ';')"
+	kul=$(debugfs -R "testb $HB $HN" "$F" 2>/dev/null | grep -c 'marked in use')
+	log "OKU ic fs hedef bolge (debugfs -w YOK, testb $HB $HN): kullanimda=$kul"
+	# --- G50 E5 sonrası (YALNIZ OKUMA; iç fs bağlanmaz, debugfs -w yok; /run'a yalnız geçici E4 desen kopyası) ---
+	E5_YOL=/kk-e5/e5-test.bin; E5_SHA=${KK_E5_SHA:-cabb2162356224aa593571b51949c84e52445be3a70341859e578d00ce14859c}; E5_BOY=4194304
+	E4_SHA=${KK_E4_SHA:-a11533fecd41fc0ff15febc24478e179af6475b21e20f002edee75c21981dea5}
+	FM_SHA=${KK_FM_SHA:-005945c8bf5dbd36862a5858535813e9921fae3ea74fad11e3f71d0d72a28f52}	# E4 sonrası 4.9 kaydı (oku-sonra)
+	YEDEK=${KK_YEDEK:-e87a53a5542c685e13b8675eee66219e86e37835fcdb9a743c049ed6e1c99d7d c5f198338eab40bb3a4b6a3156e491e09ed24f40c8a38b2db79b1950e5a4c399 e115f472556e1079f818240c89478785241bbe3fd26f78563783631b2a606812 3a72239a04d00253b0d2786abfe18c1110e2391ed6b9d0758c0eb07125c715c4}
+	E6S=$(debugfs -c -R "cat /kk/durum/sayac" "$F" 2>/dev/null | head -n 1 | tr -d '\000' | sed 's/ *$//'); e6=yok
+	if [ "$(debugfs -R "stat ${E5_YOL%/*}" "$F" 2>/dev/null | grep -c '^Inode:')" = 0 ]; then
+		e5=yok; log "E5 yok: ic fs'te ${E5_YOL%/*} yok (E5 oncesi)"
+	elif [ -n "$E6S" ]; then
+		e5=e6; log "E5 atlandi: ic fs'te /kk/durum/sayac var (E6 basladi; ic fs her oturumda yaziliyor -> E5 olcutleri gecersiz)"
+	else
+		X=
+		e5k() { if [ "$2" = "$3" ]; then log "E5 ok $1 = $2"; else log "E5 FARK $1: '$2' (beklenen '$3')"; X="$X $1"; fi; }
+		e5k e2fsck "rc=$er" rc=0
+		e5k ust "$(dumpe2fs -h "$F" 2>/dev/null | awk -F': *' '/^Filesystem volume name:/{a=$2} /^Filesystem state:/{d=$2} /^Filesystem features:/{k=($2 ~ /needs_recovery/)} /^Mount count:/{m=$2} END{printf "ad=%s durum=%s kurtarma=%d baglama=%s\n", a, d, k, m}')" "ad=kk-anahat durum=clean kurtarma=0 baglama=1"
+		log "E5 kok: $(debugfs -R "ls /" "$F" 2>/dev/null | tr -s ' \n' ' ' | cut -c1-200)"
+		e5k dosya "$(debugfs -R "stat $E5_YOL" "$F" 2>/dev/null | sed -n 's/.*Size: \([0-9]*\).*/\1/p' | head -n 1) $(debugfs -R "cat $E5_YOL" "$F" 2>/dev/null | sha256sum | cut -c1-64)" "$E5_BOY $E5_SHA"
+		BL=$(debugfs -R "blocks $E5_YOL" "$F" 2>/dev/null)
+		e5k bloklar "$(echo $BL | awk -v h=$HB -v n=$HN '{for(i=1;i<=NF;i++){b=$i;c++;if(b>=h&&b<h+n)e++;if(b==0||b==32768||b==98304||b==163840||b==229376||b==262143)k++}}END{printf "say=%d e4=%d nokta=%d\n",c,e,k}')" "say=$((E5_BOY / 4096)) e4=0 nokta=0"
+		log "E5 dosya bloklari: $(echo $BL | awk '{a=$1;z=$1;for(i=2;i<=NF;i++){if($i<a)a=$i;if($i>z)z=$i}printf "en_kucuk=%s en_buyuk=%s say=%d", a, z, NF}')"
+		set -- $NK
+		e5k yedek-superblok "$2 $3 $4 $5" "$YEDEK"
+		log "E5 bilgi nokta0=$1 son4k=$6 (nokta0 = birincil superblok; E5'te degismesi beklenir)"
+		e5k fiemap-sha "$(sha256sum "$FM-o1.txt" | cut -c1-64)" "$FM_SHA"
+		if [ "$db" = "$E4_SHA" ]; then log "E5 ok e4-dilim = desen ($E4_SHA)"
+		else	# değişen her 4 KiB blok iç fs'te kullanımda olmalı (aksi: iç fs dışı yazma)
+			awk -v b=$((wb + HB * 8)) 'BEGIN{for(i=0;i<2048;i++){s=sprintf("KK-G48-E4 sektor=%010d ",b+i);while(length(s)<511)s=s ".";print s}}' > "$L.desen"
+			dg=; i=0
+			while [ $i -lt $HN ]; do
+				a=$(dd if="$F" bs=4096 skip=$((HB + i)) count=1 iflag=direct 2>/dev/null | sha256sum | cut -c1-64)
+				b=$(dd if="$L.desen" bs=4096 skip=$i count=1 2>/dev/null | sha256sum | cut -c1-64)
+				[ "$a" = "$b" ] || dg="$dg $((HB + i))"; i=$((i + 1))
+			done
+			kk=0; for b in $dg; do debugfs -R "testb $b" "$F" 2>/dev/null | grep -q 'marked in use' && kk=$((kk + 1)); done
+			n=$(echo $dg | wc -w); rm -f "$L.desen"
+			log "E5 e4-dilim degisti: degisen_blok=$n ic_fs_kullanimda=$kk ilk8=$(echo $dg | cut -d' ' -f1-8)"
+			[ "$n" -gt 0 ] && [ "$n" = "$kk" ] || X="$X e4-dilim"
+		fi
+		if [ -z "$X" ]; then e5=gecti; else e5="KALDI:$(echo $X | tr ' ' ',')"; fi
+		log "E5 HUKUM $e5"
+	fi
+	# --- G52 E6 (öneri; YALNIZ OKUMA: debugfs -c, bağlama yok, debugfs -w yok) ---
+	if [ -n "$E6S" ]; then
+		X=
+		e6k() { if [ "$2" = "$3" ]; then log "E6 ok $1 = $2"; else log "E6 FARK $1: '$2' (beklenen '$3')"; X="$X $1"; fi; }
+		e6a() { echo " $1 " | tr ' ' '\n' | sed -n "s/^$2=//p" | head -n 1; }
+		U6=$(dumpe2fs -h "$F" 2>/dev/null | awk -F': *' '/^Filesystem volume name:/{a=$2} /^Filesystem UUID:/{u=$2} /^Filesystem state:/{d=$2} /^Filesystem features:/{k=($2 ~ /needs_recovery/);o=$2;gsub(/ ?needs_recovery/,"",o)} /^Mount count:/{m=$2} END{gsub(/ /,"_",d);printf "ad=%s uuid=%s durum=%s kurtarma=%d baglama=%s|%s\n", a, u, d, k, m, o}')
+		log "E6 sayac: $E6S"
+		log "E6 ust: ${U6%%|*}"
+		e6k kimlik "$(e6a "${U6%%|*}" ad) $(e6a "${U6%%|*}" uuid)" "kk-anahat ${KK_IUUID:-@@GUID@@}"
+		e6k ozellik "${U6#*|}" "has_journal ext_attr resize_inode dir_index filetype extent 64bit flex_bg sparse_super large_file huge_file dir_nlink extra_isize metadata_csum"
+		e6k fiemap-sha "$(sha256sum "$FM-o1.txt" | cut -c1-64)" "$FM_SHA"
+		case "$E6S" in "KKSAYAC 1 "*) log "E6 ok sayac-bicim";; *) log "E6 FARK sayac-bicim"; X="$X sayac";; esac
+		K6=$(e6a "${U6%%|*}" kurtarma); SD6=$(e6a "$E6S" durum)
+		if [ "$K6" = 0 ] && [ "$SD6" = KAPALI ] && [ "$(e6a "${U6%%|*}" durum)" = clean ]; then
+			e6k e2fsck "rc=$er" rc=0; e6=temiz
+		else
+			log "E6 bilgi: ic fs KIRLI (kurtarma=$K6 sayac_durum=$SD6 durum=$(e6a "${U6%%|*}" durum)); e2fsck -fn rc=$er yalniz bilgi (gunluk oynatilmadan); ana hat sonraki acilista -f -p ile oynatir"
+			e6=kirli
+		fi
+		log "E6 kirli_ardisik=$(e6a "$E6S" kirli) duz_ardisik=$(e6a "$E6S" duz) bag=$(e6a "$E6S" bag) kirli_top=$(e6a "$E6S" kirli_top) son_neden=$(e6a "$E6S" son_neden)"
+		log "E6 kok: $(debugfs -c -R "ls /" "$F" 2>/dev/null | tr -s ' \n' ' ' | cut -c1-200)"
+		for d in $(debugfs -c -R "ls /journal" "$F" 2>/dev/null | tr -s ' \n' ' ' | grep -oE '[0-9a-f]{32}' | sort -u | head -n 2); do
+			log "E6 journal/$d: $(debugfs -c -R "ls -l /journal/$d" "$F" 2>/dev/null | awk 'NF>=9{n++;s+=$6}END{printf "dosya=%d bayt=%d", n-2, s}')"
+		done
+		if [ -z "$X" ]; then log "E6 HUKUM $e6"; else e6="KALDI:$(echo $X | tr ' ' ',')"; log "E6 HUKUM $e6"; fi
+	fi
+	BITTI=1; log "SONUC tamam mod=oku W_BAS=$wb e5=$e5 e6=$e6"
+	exit 0
+fi
+
+# --- oluşturma ---
+d=$DIZ; yeni=""
+while [ ! -d "$d" ]; do yeni="$d $yeni"; d=${d%/*}; done
+for d in $yeni; do mkdir -m 0700 "$d" || dur "mkdir $d"; ACILAN="$d $ACILAN"; done
+log "acilan dizinler: ${yeni:-yok}"
+
+# --- G48 (a) prova: collapse-range + truncate fiziksel blokları taşımıyor mu (aynı dosya sisteminde, aynı dizinde) ---
+if [ $MOD = prova ]; then
+	F=$DIZ/prova.img; PB=$((PBOY / 4096)); CB=$((PC / 4096)); TB=$((PT / 4096))
+	[ -e "$F" ] && { BITTI=1; dur "$F zaten var (onceki prova artigi?); dokunulmadi"; }
+	OLUSAN=1; fallocate -l $PBOY "$F" || dur "prova fallocate $PBOY"
+	sync; filefrag -v -e "$F" > "$FM-p0.txt" 2>&1
+	harita "$FM-p0.txt" $CB $PB > "$FM-h0k.txt"; harita "$FM-p0.txt" $CB $((CB + TB)) > "$FM-h0t.txt"
+	log "PROVA p0 (fallocate $PBOY B): ext=$(grep -cE '^ *[0-9]+:' "$FM-p0.txt") tutulacak $((CB * 4096))+$((TB * 4096)) harita: $(tr '\n' ';' < "$FM-h0t.txt")"
+	grep -qx "toplam $((PB - CB))" "$FM-h0k.txt" && grep -qx "toplam $TB" "$FM-h0t.txt" && grep -qx "unwritten-disi 0" "$FM-h0k.txt" \
+		|| dur "prova: fallocate sonrasi harita eksik/delikli ya da yazilmis extent var"
+	fallocate --collapse-range --offset 0 --length $PC "$F" || dur "prova collapse-range 0+$PC"
+	sync; filefrag -v -e "$F" > "$FM-p1.txt" 2>&1; harita "$FM-p1.txt" 0 $((PB - CB)) > "$FM-h1.txt"
+	log "PROVA p1 (collapse 0+$PC): boy=$(stat -c %s "$F") ext=$(grep -cE '^ *[0-9]+:' "$FM-p1.txt")"
+	[ "$(stat -c %s "$F")" = $((PBOY - PC)) ] || dur "prova: collapse sonrasi boy $((PBOY - PC)) degil"
+	cmp -s "$FM-h0k.txt" "$FM-h1.txt" || dur "prova: collapse sonrasi fiziksel harita degisti"
+	truncate -s $PT "$F" || dur "prova truncate $PT"
+	sync; filefrag -v -e "$F" > "$FM-p2.txt" 2>&1; harita "$FM-p2.txt" 0 $TB > "$FM-h2.txt"; harita "$FM-p2.txt" 0 $PB > "$FM-h2b.txt"
+	log "PROVA p2 (truncate $PT): boy=$(stat -c %s "$F") ext=$(grep -cE '^ *[0-9]+:' "$FM-p2.txt") harita: $(tr '\n' ';' < "$FM-h2.txt")"
+	[ "$(stat -c %s "$F")" = $PT ] || dur "prova: truncate sonrasi boy $PT degil"
+	cmp -s "$FM-h0t.txt" "$FM-h2.txt" || dur "prova: truncate sonrasi tutulan araligin fiziksel haritasi degisti"
+	cmp -s "$FM-h2.txt" "$FM-h2b.txt" || dur "prova: truncate sonrasi dosya sonunun otesinde blok kaldi"
+	rm -f "$F" || dur "prova rm"; sync; OLUSAN=0
+	[ -e "$F" ] && dur "prova: dosya silinemedi"
+	for d in $ACILAN; do rmdir "$d" 2>/dev/null && log "prova: acilan dizin $d kaldirildi"; done; ACILAN=""
+	bos2=$(df -B1 --output=avail "$MNT" | tail -1 | tr -d ' ')
+	BITTI=1
+	log "PROVA tamam: tutulan aralik fiziksel olarak ayni (collapse + truncate); prova.img silindi; bos alan $bos -> $bos2 (fark $((bos - bos2)) B)"
+	log "SONUC tamam mod=prova"
+	exit 0
+fi
+
+# G47: tek deneme, büyük dosya -> ardışık 1 GiB alt aralık -> öndekini collapse, arkadakini truncate
+deneme=1
+OLUSAN=1; fallocate -l $BUYUK "$F" || dur "fallocate $BUYUK"
+sync; filefrag -v -e "$F" > "$FM-0a.txt" 2>&1; sb=$(sec "$FM-0a.txt"); log "buyuk dosya ($BUYUK B) fiemap: $sb"
+[ "$(alan "$sb" tamam)" = 1 ] || dur "buyuk dosyada mantiksal+fiziksel ardisik $BLK blok yok"
+SL=$(alan "$sb" L); SP=$(alan "$sb" P)
+if [ "$SL" -gt 0 ]; then
+	fallocate --collapse-range --offset 0 --length $((SL * 4096)) "$F" || dur "collapse-range 0+$((SL * 4096))"
+	log "collapse-range: 0+$((SL * 4096)) B (oncesi bosaltildi, kalan mantiksal olarak kaydirildi)"
+fi
+truncate -s $BOY "$F" || dur "truncate $BOY"
+sync; s0=$(fiemap 0b); log "kirpma sonrasi fiemap: $s0"
+[ "$(alan "$s0" tamam)" = 1 ] && [ "$(alan "$s0" ilk)" = "$SP" ] && [ "$(alan "$s0" unwritten)" = "$(alan "$s0" ext)" ] &&
+	[ "$(stat -c %s "$F")" = "$BOY" ] || dur "kirpma sonrasi: ardisik degil / ilk fiziksel $SP degil / yazilmis extent / boy"
+dd if=/dev/zero of="$F" bs=4M count=$((BOY / 4194304)) conv=notrunc,fsync oflag=direct 2>> "$L" || dur "dd sifir yazimi"
+sync; s1=$(fiemap 1); log "sifir yazimi sonrasi fiemap: $s1"
+[ "$(alan "$s1" tamam)" = 1 ] && [ "$(alan "$s1" unwritten)" = 0 ] && [ "$(alan "$s1" ilk)" = "$(alan "$s0" ilk)" ] || dur "sifir yazimi sonrasi ardisik/written degil ya da yer degisti"
+UNIX_IO_NOZEROOUT=1 mke2fs -F -q -t ext4 -b 4096 -L kk-anahat -E nodiscard,lazy_itable_init=0,lazy_journal_init=0 "$F" >> "$L" 2>&1 || dur "mke2fs"
+sync; s2=$(fiemap 2); log "mke2fs sonrasi fiemap: $s2"
+cmp -s "$FM-1.txt" "$FM-2.txt" || dur "mke2fs fiemap'i degistirdi"
+$CHATTR +i "$F" || dur "chattr +i"
+at=$($LSATTR -d "$F" 2>&1 | cut -d' ' -f1); log "lsattr: $at"
+case "$at" in *i*) ;; *) dur "lsattr'da i yok";; esac
+sync; s3=$(fiemap 3); cmp -s "$FM-1.txt" "$FM-3.txt" || dur "chattr sonrasi fiemap degisti"
+( : >> "$F" ) 2>/dev/null && dur "immutable dosya yazmaya acilabildi"
+log "e2fsck -fn (ic fs, salt okuma): $(e2fsck -fn "$F" 2>&1 | tail -1)"
+log "ic fs: $(dumpe2fs -h "$F" 2>/dev/null | grep -E '^(Filesystem volume name|Filesystem UUID|Filesystem features|Block count):' | sed 's/  */ /g' | tr '\n' ';')"
+ilk=$(alan "$s3" ilk); wb=$((UD_BAS + ilk * 8)); ws=$((BLK * 8))
+[ $((wb % 8)) = 0 ] && [ "$wb" -ge "$UD_BAS" ] && [ $((wb + ws)) -le $((UD_BAS + UD_BOY)) ] || dur "pencere p68 disina tasiyor ya da 8'in kati degil (W_BAS $wb)"
+[ "$(alan "$s3" unwritten)" = 0 ] || dur "son fiemap'te unwritten extent var"
+# G48 (b): 6 nokta, 4 KiB; dosyadan ve p68'den ham okuma (ikisi de iflag=direct, salt okuma); ikisi aynı olmalı
+SIFIR=$(head -c 4096 /dev/zero | sha256sum | cut -c1-64); nz=0
+for o in 0 134217728 402653184 671088640 939524096 $((BOY - 4096)); do
+	[ $((o + 4096)) -le "$(stat -c %s "$F")" ] || dur "nokta $o dosya disinda (boy $(stat -c %s "$F"))"
+	h=$(dd if="$F" bs=4096 skip=$((o / 4096)) count=1 iflag=direct 2>/dev/null | sha256sum | cut -c1-64)
+	if [ -b "$P" ]; then r=$(dd if="$P" bs=4096 skip=$((ilk + o / 4096)) count=1 iflag=direct 2>/dev/null | sha256sum | cut -c1-64); hd=ayni
+	else [ -n "${KK_LOG:-}" ] || dur "$P blok aygiti degil"; r=$h; hd=yerel-atlandi; fi
+	[ "$h" = "$r" ] || dur "nokta $o: dosya ($h) ve p68 ham okuma ($r) farkli"
+	z=0; [ "$h" = "$SIFIR" ] && z=1; [ $z = 0 ] && nz=$((nz + 1))
+	log "NOKTA ofs=$o mib=$((o / 1048576)) sektor=$((wb + o / 512)) sha256=$h sifir=$z ham_p68=$hd"
+done
+[ $nz -ge 2 ] || dur "sifir disi nokta $nz < 2 (ic dosya sistemi bloklari bekleniyordu)"
+fs=$(sha256sum "$FM-3.txt" | cut -c1-64); ds=$(sha256sum "$F" | cut -c1-64)
+bos2=$(df -B1 --output=avail "$MNT" | tail -1 | tr -d ' ')
+BITTI=1
+log "KAYIT dosya=$F inode=$(stat -c %i "$F") boy=$(stat -c %s "$F") deneme=$deneme buyuk=$BUYUK secilen_mantiksal=$SL secilen_fiziksel=$SP"
+log "KAYIT fiziksel_ilk_blok=$ilk fiziksel_son_blok=$(alan "$s3" son) blok_say=$BLK extent=$(alan "$s3" ext) unwritten_extent=$(alan "$s3" unwritten)"
+log "KAYIT W_BAS=$wb W_SAY=$ws W_SON=$((wb + ws)) (p68 icinde sektor $((ilk * 8))..$((ilk * 8 + ws - 1)); p68 bitisi $((UD_BAS + UD_BOY)))"
+log "KAYIT sifir_disi_nokta=$nz bos_once=$bos bos_sonra=$bos2 fark=$((bos - bos2))"
+log "KAYIT fiemap_sha256=$fs alan_img_sha256=$ds"
+log "SONUC tamam mod=olustur W_BAS=$wb W_SAY=$ws"
+exit 0
+#--- CIHAZ SONU ---

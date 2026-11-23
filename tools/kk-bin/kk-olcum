@@ -1,0 +1,46 @@
+#!/bin/bash
+# Kara Kutu kk-bin: onaylı ölçüm betiği olcum.sh'ı Debian'da `sudo -n sh -s` ile çalıştır. YALNIZ OKUMA.
+#   kk-olcum <cikti-dosyasi>
+# olcum.sh = work/g29/b/olcum.sh'ın bayt bayt kopyası (sha fb9f453e…, bakımcı onaylı; docs/guvenlik-tasarimi.md kural 11).
+# Sha her çalıştırmada denetlenir; tutmazsa çalıştırmaz. Çıktı dosyası /opt/kara-kutu/work/ altında YENİ bir dosya olmalı.
+# Ekrana oeminfo ve ext_csd satırları basılmaz (dosyada kalır). Değiştirmek bakımcının onayını gerektirir.
+# G50 (bakımcı onayı (i), G49 önerisi): ortak kk-bin kilidi (flock -n, work/kk-bin-log/kk-bin.kilit, fd 9); doluysa çıkış 77, hiçbir şey yapılmaz.
+set -u
+KB=/opt/kara-kutu/tools/kk-bin; O=$KB/olcum.sh
+OSHA=fb9f453ebc72123acbad58b9de4d8e4908bba3f2b91cfe8439dbf84d78220526
+LOG=/opt/kara-kutu/work/kk-bin-log/kk-bin.log; mkdir -p "${LOG%/*}"
+log() { echo "$(date -u '+%F %T.%3N') UTC [kk-olcum] $*" | tee -a "$LOG"; }
+SSH=(ssh -o UserKnownHostsFile=$KB/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=10 ${KK_KULLANICI:-kk}@172.16.42.1)
+[ $# -eq 1 ] || { echo "kullanim: kk-olcum <cikti-dosyasi>" >&2; exit 64; }
+OUT=$(realpath -m -- "$1")
+case $OUT in /opt/kara-kutu/work/*) ;; *) log "DUR: cikti work/ disinda: $OUT"; exit 64;; esac
+[ -e "$OUT" ] && { log "DUR: cikti zaten var (ustune yazilmaz): $OUT"; exit 64; }
+[ -d "${OUT%/*}" ] || { log "DUR: dizin yok: ${OUT%/*}"; exit 64; }
+[ "$(sha256sum "$O" | cut -c1-64)" = $OSHA ] || { log "DUR: olcum.sh degismis; calistirilmadi"; exit 65; }
+# --- G49 ortak kilit (kural 17'nin mekanik karşılığı): cihaza dokunan kk-bin çağrıları tek tek. ---
+# flock, work/kk-bin-log/kk-bin.kilit üzerinde, fd 9. Bekleme YOK (-n): kilit doluysa hemen 77, cihaz işlemi yapılmaz.
+# Miras: iç içe kk-bin çağrısı üstünün fd 9'unu (aynı açık dosya tanımı) devralır; flock aynı tanımda yeniden başarılı.
+# Ortam değişkeni (KK_KILIT_SAHIBI) yalnız log içindir; mirası açmaz. Kilidi tutan süreç ve fd 9'u devralan çocukları
+# bitince (SIGKILL dahil) çekirdek kilidi bırakır: bayat kilit olmaz (dosya kalır, içeriği yalnız "son sahip" bilgisi).
+KK_KILIT=/opt/kara-kutu/work/kk-bin-log/kk-bin.kilit
+kk_kilit() {
+	local kl=${KK_KILIT%/*}/kk-bin.log ad=${0##*/} t
+	t=$(date -u '+%F %T.%3N')
+	mkdir -p "${KK_KILIT%/*}" || exit 77
+	if [ /proc/$$/fd/9 -ef "$KK_KILIT" ] && flock -n 9; then
+		echo "$t UTC [$ad] kilit: miras (sahip ${KK_KILIT_SAHIBI:-?}; pid $$)" >> "$kl"; return 0
+	fi
+	if exec 9>>"$KK_KILIT" && flock -n 9; then
+		export KK_KILIT_SAHIBI="pid=$$ $ad"
+		printf 'pid=%s betik=%s arg=%.80s bas=%s UTC\n' $$ "$ad" "$*" "$t" > "$KK_KILIT"
+		echo "$t UTC [$ad] kilit: alindi (pid $$)" >> "$kl"; return 0
+	fi
+	echo "$t UTC [$ad] RED: kk-bin kilidi mesgul (son sahip: $(head -c 200 "$KK_KILIT" 2>/dev/null | tr -d '\n')); cihaz islemi YAPILMADI; cikis 77" | tee -a "$kl" >&2
+	exit 77
+}
+kk_kilit "$@"
+# --- G49 ortak kilit sonu ---
+"${SSH[@]}" 'sudo -n sh -s' < "$O" > "$OUT" 2>&1; R=$?
+log "olcum -> $OUT rc=$R ext_csd_512B=$(grep -c '^ext_csd: [0-9a-f]\{1024\}$' "$OUT")"
+grep -v '^oeminfo\|^ext_csd' "$OUT"
+exit "$R"

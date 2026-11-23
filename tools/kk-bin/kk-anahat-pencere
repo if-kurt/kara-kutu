@@ -1,0 +1,467 @@
+#!/bin/bash
+# Kara Kutu kk-bin ÖNERİSİ (G48, eMMC E4; ONAY BEKLİYOR, kk-bin'e KONMADI): ana hat Debian'ında (6.12 E2 imajı, SSH 2222)
+# eMMC yazma penceresinin denetimi ve E4'ün TEK ham yazması.
+#   kk-anahat-pencere denetle <cikti>  YALNIZ OKUMA: kk_yazma, DT (6 özellik), çekirdek GPT görünümü, kapasite, dmesg
+#                                      sayaçları, kkdata (needs_recovery yok, /data ro), alan.img (immutable, 1 GiB, FIEMAP
+#                                      ardışık = W_BAS), iç fs'te hedef bölgenin boş olduğu (debugfs -w YOK), 6 nokta, stat.
+#   kk-anahat-pencere yaz <cikti>      denetle + E4: "ac" -> hedef bölgeye (pencere içi blok 261632..261887 = alan.img'de
+#                                      1022 MiB'tan 1 MiB) belirlenimci 1 MiB desen, /dev/mmcblk0p68 üzerinden O_DIRECT
+#                                      (CMD25'ler) -> HEMEN "kapat" -> geri okuma (p68, tüm disk, dosya) sha = desen;
+#                                      6 nokta değişmedi; diskstats yazılan sektör farkı = 2048; dmesg ACIK 1 / KAPALI 1.
+# loop/dm GEREKMEZ (E1/E2 çekirdeğinde CONFIG_BLK_DEV_LOOP ve DM yok). İç fs BAĞLANMAZ; hedef bölge iç fs'te boş bloklar
+#   (4.9 "kk-49-alan oku" ve burada debugfs testb ile önce denetlenir) -> iç fs tutarlı kalır.
+# Sabitler (W_BAS, 6 nokta sha'ları, desen sha'sı) betikte; değişirse betik sha'sı değişir -> yeniden onay (kural 12).
+# Öz doğrulama: sha256 SHA256SUMS'taki satırla aynı değilse çalışmaz. Hedef uname ^6\.12\.[0-9]+-kk-g[0-9]+$ (kk-anahat-ssh).
+# Cihaz betiği systemd-run birimi (SSH koparsa da sürer), RuntimeMaxSec=300; trap HER çıkışta "kapat" yazar ("yaz" modunda).
+# Bekleme 65 x 5 sn (G50; kural 16). Çıkış: 0 tamam / 3 dur (ölçüt tutmadı; pencere kapatıldı) / 1 bağlantı / 64 girdi / 65 doğrulama.
+# Log: /opt/kara-kutu/work/kk-bin-log/kk-bin.log.
+# G50 (bakımcı onayı (i), G49 önerisi): ortak kk-bin kilidi (flock -n, work/kk-bin-log/kk-bin.kilit, fd 9); doluysa çıkış 77, hiçbir şey yapılmaz.
+# G52 E6-0 ÖNERİSİ (ONAY BEKLİYOR, kk-bin'e KONMADI): alan.img iç fs'inin açılışta bağlandığı E6 imajı için iki yeni mod:
+#   kk-anahat-pencere e6 <cikti>          YALNIZ OKUMA: kk-alan durumu (/run/kk-alan), pencere, loop sysfs (ro/dio/ofset/boy),
+#                                         bağlama seçenekleri, /var/log/journal bind'i, journald'ın alana yazdığı, sayaç,
+#                                         kapsam (eMMC yazma sektörü = loop yazma sektörü), discard 0, sınır bekçileri, dmesg.
+#                                         kip rw / ro / kapali için ayrı ölçüt; kip yok/dur/bozuk -> DUR. Hiçbir şey yazmaz.
+#   kk-anahat-pencere e6-sifirla <cikti>  YALNIZ kk-alan kip=ro (SAYAC-DUR ya da sayac-okunamadi) iken ve pencere "hazir"ken:
+#                                         ro bağlamayı ve ro loop'u bırakır -> "ac" -> rw loop (O_DIRECT) -> e2fsck -f -p (rc 0/1;
+#                                         başka -> DUR, -y YOK) -> rw bağla -> sayaç kirli=0 duz=0 durum=KAPALI (yerinde O_DIRECT,
+#                                         4 KiB) -> umount -> losetup -d -> "kapat" -> ro loop'tan e2fsck -fn rc 0 + sayaç geri okuma.
+#                                         Pencere o açılışta kilitli kalır; alan sonraki açılışta rw kipe döner.
+# G50 E5 (bakımcı onayı: U1 + E5 sınamaları geçerse; tek sefer):
+#   kk-anahat-pencere e5 <cikti>       denetle (E4 izi = desen beklenir; iç fs SALT OKUNUR loop'tan: temiz, hiç bağlanmamış, /kk-e5
+#                                      yok) + E5: "ac" -> loop (p68, ofset 557056 x 4096, 1 GiB, --direct-io=on) -> mount -w (rw,noatime,
+#                                      nodiscard,noinit_itable,data=ordered,errors=remount-ro) -> TEK test dosyası /kk-e5/e5-test.bin
+#                                      (4 MiB belirlenimci desen, son satırı işaret satırı, sha sabit) + fsync -> umount -> losetup -d ->
+#                                      "kapat" -> (pencere KAPALI) yeni salt okunur loop: e2fsck -fn, dumpe2fs, debugfs cat sha, bloklar,
+#                                      E4 dilimi, 4 yedek süper blok, diskstats (yazma <= 64 MiB, discard 0), dmesg, pencere açık süresi.
+#   Trap (her çıkış): umount -> bizim loop'larımızı sil -> "kapat" (sıra önemli). alan.img /data üzerinden okunmaz (önbellek).
+#   denetle G50'de E4 izini (hedef = desen) bekler; yaz (E4) hedef desense DUR (ikinci E4 yok; değişmedi).
+set -u
+KB=/opt/kara-kutu/tools/kk-bin; ME=$(realpath -- "$0")
+LOG=/opt/kara-kutu/work/kk-bin-log/kk-bin.log; mkdir -p "${LOG%/*}"
+log() { echo "$(date -u '+%F %T.%3N') UTC [kk-anahat-pencere] $*" | tee -a "$LOG" >&2; }
+[ $# -eq 2 ] || { echo "kullanim: kk-anahat-pencere denetle|yaz|e5|e6|e6-sifirla <cikti-dosyasi>" >&2; exit 64; }
+MOD=$1; case $MOD in denetle|yaz|e5|e6|e6-sifirla) ;; *) echo "kullanim: kk-anahat-pencere denetle|yaz|e5|e6|e6-sifirla <cikti-dosyasi>" >&2; exit 64;; esac
+OUT=$(realpath -m -- "$2")
+case $OUT in /opt/kara-kutu/work/*) ;; *) log "DUR: cikti work/ disinda: $OUT"; exit 64;; esac
+[ -e "$OUT" ] && { log "DUR: cikti zaten var: $OUT"; exit 64; }
+[ -d "${OUT%/*}" ] || { log "DUR: dizin yok: ${OUT%/*}"; exit 64; }
+want=$(awk '$2=="kk-anahat-pencere"{print $1}' "$KB/SHA256SUMS"); have=$(sha256sum "$ME" | cut -c1-64)
+[ -n "$want" ] && [ "$want" = "$have" ] || { log "DUR: betik sha256 SHA256SUMS ile tutmadi ($have)"; exit 65; }
+CIHAZ=$(sed -n '/^#--- CIHAZ BASI ---$/,/^#--- CIHAZ SONU ---$/p' "$ME")
+CSHA=$(printf '%s\n' "$CIHAZ" | sha256sum | cut -c1-64)
+# --- G49 ortak kilit (kural 17'nin mekanik karşılığı): cihaza dokunan kk-bin çağrıları tek tek. ---
+# flock, work/kk-bin-log/kk-bin.kilit üzerinde, fd 9. Bekleme YOK (-n): kilit doluysa hemen 77, cihaz işlemi yapılmaz.
+# Miras: iç içe kk-bin çağrısı üstünün fd 9'unu (aynı açık dosya tanımı) devralır; flock aynı tanımda yeniden başarılı.
+# Ortam değişkeni (KK_KILIT_SAHIBI) yalnız log içindir; mirası açmaz. Kilidi tutan süreç ve fd 9'u devralan çocukları
+# bitince (SIGKILL dahil) çekirdek kilidi bırakır: bayat kilit olmaz (dosya kalır, içeriği yalnız "son sahip" bilgisi).
+KK_KILIT=/opt/kara-kutu/work/kk-bin-log/kk-bin.kilit
+kk_kilit() {
+	local kl=${KK_KILIT%/*}/kk-bin.log ad=${0##*/} t
+	t=$(date -u '+%F %T.%3N')
+	mkdir -p "${KK_KILIT%/*}" || exit 77
+	if [ /proc/$$/fd/9 -ef "$KK_KILIT" ] && flock -n 9; then
+		echo "$t UTC [$ad] kilit: miras (sahip ${KK_KILIT_SAHIBI:-?}; pid $$)" >> "$kl"; return 0
+	fi
+	if exec 9>>"$KK_KILIT" && flock -n 9; then
+		export KK_KILIT_SAHIBI="pid=$$ $ad"
+		printf 'pid=%s betik=%s arg=%.80s bas=%s UTC\n' $$ "$ad" "$*" "$t" > "$KK_KILIT"
+		echo "$t UTC [$ad] kilit: alindi (pid $$)" >> "$kl"; return 0
+	fi
+	echo "$t UTC [$ad] RED: kk-bin kilidi mesgul (son sahip: $(head -c 200 "$KK_KILIT" 2>/dev/null | tr -d '\n')); cihaz islemi YAPILMADI; cikis 77" | tee -a "$kl" >&2
+	exit 77
+}
+kk_kilit "$@"
+# --- G49 ortak kilit sonu ---
+T=$(mktemp -d) || exit 70
+SSH=(ssh -p 2222 -o UserKnownHostsFile=$KB/known_hosts_anahat -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=10
+     -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -S "$T/s" ${KK_KULLANICI:-kk}@172.16.42.1)
+bitir() { "${SSH[@]}" -O exit >/dev/null 2>&1; rm -f -- "$T/s"; rmdir -- "$T" 2>/dev/null; }
+trap bitir EXIT
+r() { timeout 60 "${SSH[@]}" "$1"; }
+timeout 20 "${SSH[@]}" -M -fN 9>&- 2>/dev/null || { log "DUR: 172.16.42.1:2222 baglanti yok"; exit 1; }
+un=$(r 'uname -r' 2>/dev/null | tr -d '\r')
+[[ $un =~ ^6\.12\.[0-9]+-kk-g[0-9]+$ ]] || { log "DUR: uname tutmadi ('${un:0:60}'); hicbir sey yapilmadi"; exit 65; }
+onceki=$(r 'systemctl is-active kk-anahat-pencere.service' 2>/dev/null | tr -d '\r\n')
+[ "$onceki" = inactive ] || { log "DUR: onceki birim durumu: '$onceki'"; exit 65; }
+uz=$(printf '%s\n' "$CIHAZ" | timeout 30 "${SSH[@]}" 'sudo -n tee /run/kk-anahat-pencere.sh >/dev/null && sudo -n sh -n /run/kk-anahat-pencere.sh && sha256sum /run/kk-anahat-pencere.sh' 2>&1 | cut -c1-64)
+[ "$uz" = "$CSHA" ] || { log "DUR: cihaz betigi sha tutmadi (yerel $CSHA, uzak '${uz:0:64}')"; exit 65; }
+log "uname OK $un; cihaz betigi /run/kk-anahat-pencere.sh sha $CSHA; mod=$MOD -> $OUT"
+r "sudo -n systemd-run --unit=kk-anahat-pencere --collect -p RuntimeMaxSec=300 /bin/sh /run/kk-anahat-pencere.sh $MOD" >/dev/null 2>&1 \
+	|| { log "DUR: systemd-run basarisiz"; exit 3; }
+# Bekleme: sleep + kesin üst süre (G50: 65 x 5 sn = 325 sn > birimin 300 sn'si -> birim bitmeden çıktı alınmaz); durum birim adıyla (kural 16).
+st=active; i=0
+while [ $i -lt 65 ]; do
+	sleep 5; i=$((i+1))
+	st=$(r 'systemctl is-active kk-anahat-pencere.service' 2>/dev/null | tr -d '\r'); st=${st:-baglanti-yok}
+	case $st in active|activating|baglanti-yok) ;; *) break;; esac
+done
+log "birim: $st ($((i * 5)) sn)"
+{ r 'cat /run/kk-anahat-pencere.log'; echo "=== fiemap"; r 'cat /run/kk-anahat-pencere-fiemap.txt 2>/dev/null'; echo "=== e5"; r 'cat /run/kk-anahat-pencere-e5.txt 2>/dev/null'; echo "=== e6"; r 'cat /run/kk-anahat-pencere-e6.txt 2>/dev/null'; } > "$OUT" 2>&1
+grep -E 'DUR|SONUC|ACIK|KAPALI|DESEN|YAZMA|E5|E6|PENCERE|ICFS' "$OUT" | cut -c1-240 >&2
+if grep -q ' SONUC tamam' "$OUT"; then log "TAMAM: mod=$MOD; $(grep -m1 ' SONUC tamam' "$OUT" | cut -c1-200)"; exit 0; fi
+log "UYARI: mod=$MOD tamamlanmadi (birim $st); cikti $OUT"; exit 3
+
+#--- CIHAZ BASI ---
+# /run/kk-anahat-pencere.sh <denetle|yaz|e5>  (root, systemd-run birimi; ana hat Debian). KK_* YALNIZ yerel/QEMU sınaması içindir.
+set -u
+MOD=${1:-denetle}
+case $MOD in denetle|yaz|e5|e6|e6-sifirla) ;; *) echo "mod gecersiz" >&2; exit 64;; esac
+L=${KK_LOG:-/run/kk-anahat-pencere.log}; FM=${KK_FM:-/run/kk-anahat-pencere-fiemap.txt}; DS=${KK_DESEN:-/run/kk-anahat-pencere-desen.bin}
+EK=${KK_EK:-/run/kk-anahat-pencere-e5.txt}; TD=${KK_TD:-/run/kk-anahat-pencere-e5.bin}; MNT=${KK_MNT:-/run/kk-anahat-pencere-e5-mnt}
+W_BAS=${KK_W_BAS:-21282816}; W_SAY=2097152; W_SON=$((W_BAS + W_SAY))
+UD_BAS=${KK_UD_BAS:-16826368}; UD_BOY=${KK_UD_BOY:-227450880}; KART=${KK_KART:-244277248}; NO=${KK_NO:-68}
+PUUID=${KK_PUUID:-@@GUID@@}
+DT=${KK_DT:-/proc/device-tree/soc/mmc@ff3e6000}; DSK=${KK_DSK:-mmcblk0}; PRT=${KK_PRT:-mmcblk0p68}; SYS=${KK_SYS:-/sys}; DEV=${KK_DEV:-/dev}
+ALAN=${KK_ALAN:-/data/kk/anahat/alan.img}; KKD=${KK_KKD:-/data}; WBK=${KK_WBK:-5}; KATI=${KK_KATI:-1}
+DOSYA=${KK_DOSYA:-1}	# 0 yalnız QEMU: kkdata'da pencereye eşlenen dosya yok -> dosya görünümü denetimleri atlanır
+H="${KK_NOKTA:-76fdd555f1c00fb113948e2a3261ddadbec12e47f7af5dc447eedc23cf112c15 e87a53a5542c685e13b8675eee66219e86e37835fcdb9a743c049ed6e1c99d7d c5f198338eab40bb3a4b6a3156e491e09ed24f40c8a38b2db79b1950e5a4c399 e115f472556e1079f818240c89478785241bbe3fd26f78563783631b2a606812 3a72239a04d00253b0d2786abfe18c1110e2391ed6b9d0758c0eb07125c715c4 ad7facb2586fc6e966c004d7d1d16b024f5805ff7cb47c7a85dabd8b48892ca7}"
+DESEN_SHA=${KK_DESEN_SHA:-a11533fecd41fc0ff15febc24478e179af6475b21e20f002edee75c21981dea5}
+HB=261632; HN=256	# hedef: pencere/dosya içi blok 261632..261887 (1022 MiB + 1 MiB); 6 noktayla kesişmez
+# G50 E5: iç fs'e TEK test dosyası (4 MiB belirlenimci desen; son satırı işaret satırı; sha sabit, QEMU ve cihazda aynı)
+E5_SHA=${KK_E5_SHA:-cabb2162356224aa593571b51949c84e52445be3a70341859e578d00ce14859c}; E5_BOY=4194304; E5_YOL=/kk-e5/e5-test.bin
+YAZ_AZAMI=131072	# E5 toplam yazma üst sınırı (diskstats yazma sektörü farkı): 64 MiB
+IBOY=1073741824	# iç fs (alan.img) = pencere boyu
+PB=$(( (W_BAS - UD_BAS) / 8 )); DB=$((W_BAS / 8)); KY=$SYS/block/$DSK/kk_yazma; OFS=$((PB * 4096)); P=$SYS/class/block/$PRT
+: > "$L"; rm -f "$FM" "$DS" "$EK" "$TD"
+log() { echo "$(date -u '+%T') $*" >> "$L"; }
+ACILDI=0; BITTI=0; MNTD=0; MKD=0; LR=; LW=
+dur() { log "DUR: $*"; exit 3; }
+lp() {	# p68'e bağlı loop aygıtları (sysfs backing_file; util-linux çıktısına bağlı değil)
+	for b in $SYS/block/loop*/loop/backing_file; do
+		[ -f "$b" ] && [ "$(cat "$b")" = "$DEV/$PRT" ] && { b=${b%/loop/backing_file}; echo "$DEV/${b##*/}"; }
+	done
+}
+son() {
+	rc=$?
+	# G50 E5: sıra önemli: önce umount (iç fs tutarlı kapanır), sonra BİZİM loop'larımız, en son pencere "kapat"
+	if [ $MNTD = 1 ]; then umount "$MNT" 2>> "$L"; log "trap: umount rc=$?"; fi
+	for x in $LW $LR; do losetup -d "$x" 2>> "$L"; log "trap: losetup -d $x rc=$?"; done
+	if [ $ACILDI = 1 ]; then echo kapat > "$KY" 2>/dev/null; log "trap: kapat yazildi; kk_yazma: $(cat "$KY" 2>&1)"; fi
+	[ $MKD = 1 ] && rmdir "$MNT" 2>/dev/null	# yalnız bizim açtığımız bağlama noktası
+	rm -f "$DS" "$TD"
+	[ $BITTI = 1 ] || log "SONUC dur rc=$rc"
+}
+trap son EXIT; trap 'exit 4' INT TERM HUP
+q() { od -An -v -tu1 "$DT/karakutu,$1" | awk '{for(i=1;i<=NF;i++){v=v*256+$i;if(++n%4==0){printf "%s%.0f",s,v;s=" ";v=0}}}END{print ""}'; }
+r() { tr -d '\000' < "$DT/karakutu,$1"; }
+dm() { dmesg | grep -v 'kk: dmesg:' | grep -cF -- "$1"; }
+st() { set -- $(cat $SYS/block/$DSK/stat); echo "$5 $7 ${12} ${16}"; }	# yazma_io yazma_sektor discard_io flush_io
+oku4k() { dd if="$1" bs=4096 skip=$2 count=${3:-1} iflag=direct 2>/dev/null | sha256sum | cut -c1-64; }
+esit() { [ "$2" = "$3" ] || dur "$1: '$2' (beklenen '$3')"; log "ok $1 = $2"; }
+# G50: loop sysfs (ro, ofset, boy, direct-io, arka aygıt) ve iç fs üst bilgisi (tek satır)
+lo_bak() { y=$SYS/block/${2##*/}; esit "$1" "$(cat $y/ro) $(cat $y/loop/offset) $(cat $y/loop/sizelimit) $(cat $y/loop/dio) $(cat $y/loop/backing_file)" "$3 $OFS $IBOY 1 $DEV/$PRT"; }
+dh() { dumpe2fs -h "$1" 2>/dev/null | awk -F': *' '/^Filesystem volume name:/{a=$2} /^Filesystem state:/{d=$2} /^Filesystem features:/{k=($2 ~ /needs_recovery/)} /^Mount count:/{m=$2} END{printf "ad=%s durum=%s kurtarma=%d baglama=%s\n", a, d, k, m}'; }
+ek() { echo "=== $1" >> "$EK"; shift; "$@" >> "$EK" 2>&1; }
+kes() { case "${KK_E5_KES:-}" in "$1") dur "sinama kesmesi: $1";; "term-$1") log "sinama: TERM ($1)"; kill -TERM $$; sleep 2;; esac; }	# YALNIZ QEMU
+
+# --- e6 / e6-sifirla (G52 E6-0): kk-alan oturumu denetimi (YALNIZ OKUMA) / RO kipinden çıkış (tek onaylı yazma) ---
+if [ $MOD = e6 ] || [ $MOD = e6-sifirla ]; then
+	KR=${KK_ALAN_RUN:-/run/kk-alan}; AM=${KK_ALAN_MNT:-/alan}; JD=${KK_JD:-/var/log/journal}; SAYAC=/kk/durum/sayac
+	IUUID=${KK_IUUID:-@@GUID@@}; E6K=${KK_E6K:-/run/kk-anahat-pencere-e6.txt}; rm -f "$E6K"
+	al() { echo " $1 " | tr ' ' '\n' | sed -n "s/^$2=//p" | head -n 1; }
+	e6k() { echo "=== $1" >> "$E6K"; shift; "$@" >> "$E6K" 2>&1; }
+	lws() { set -- $(cat "$SYS/block/${1##*/}/stat"); echo "$7"; }
+	sin() { echo "$(oku4k $DEV/$PRT $((PB - 256)) 256) $(oku4k $DEV/$PRT $((PB + 262144)) 256)"; }
+	# G53 A12-1: E6 loop'ları TÜM DİSK üzerinde mutlak ofsetle (kk-alan ile aynı); E4/E5'in lp/lo_bak'ı DEĞİŞMEDİ
+	DOFS=$((W_BAS * 512)); KA=$SYS/block/$DSK/kk_a12
+	lp6() { for b in $SYS/block/loop*/loop/backing_file; do [ -f "$b" ] && case "$(cat "$b")" in "$DEV/$PRT"|"$DEV/$DSK") b=${b%/loop/backing_file}; echo "$DEV/${b##*/}";; esac; done; }
+	lo6() { y=$SYS/block/${2##*/}; esit "$1" "$(cat $y/ro) $(cat $y/loop/offset) $(cat $y/loop/sizelimit) $(cat $y/loop/dio) $(cat $y/loop/backing_file)" "$3 $DOFS $IBOY 1 $DEV/$DSK"; }
+	a12r() { echo " $(cat "$KA" 2>/dev/null) " | tr ' ' '\n' | sed -n 's/^red=//p' | head -n 1; }
+	hat() { dmesg | grep -v 'kk: dmesg:' | grep -ciE 'I/O error|EXT4-fs (error|warning)|Buffer I/O|recovery failed|HW reset card|mmc[0-9]+: .*timeout|remounting filesystem read-only|JBD2: .*(error|abort)'; }
+	log "basladi mod=$MOD uname=$(uname -r) up=$(cut -d' ' -f1 /proc/uptime) W=[$W_BAS, $W_SON)"
+	case "$(uname -r)" in 6.12.*-kk-g*) ;; *) [ -n "${KK_LOG:-}" ] || dur "uname ana hat degil";; esac
+	for t in losetup e2fsck dumpe2fs debugfs mount umount findmnt dd sha256sum awk journalctl systemctl blockdev; do command -v $t > /dev/null || dur "arac yok: $t"; done
+	esit dt-aralik "$(q yazma-araligi)" "$W_BAS $W_SAY"
+	esit dt-bolum "$(r yazma-bolum) $(q yazma-bolum-no) $(q yazma-bolum-araligi)" "userdata $NO $UD_BAS $UD_BOY"
+	esit dt-uuid-kart "$(r yazma-partuuid) $(q kart-sektor)" "$PUUID $KART"
+	esit gpt "$(cat $P/start) $(cat $P/size) $(cat $P/partition) $(sed -n 's/^PARTNAME=//p' $P/uevent)" "$UD_BAS $UD_BOY $NO userdata"
+	if [ "$DOSYA" = 1 ]; then
+		esit kkdata "$(findmnt -rn -o SOURCE,FSTYPE "$KKD")" "/dev/$PRT ext4"
+		case ",$(findmnt -rn -o OPTIONS "$KKD")," in *,ro,*) log "ok kkdata ro";; *) dur "kkdata ro bagli degil";; esac
+		[ -e "$KKD/kk/state/anahat-alan-bozuk" ] && dur "anahat-alan-bozuk isareti var"
+		esit alan-boy "$(stat -c %s "$ALAN")" 1073741824
+		case "$(lsattr -d "$ALAN" | cut -d' ' -f1)" in *i*) log "ok alan immutable";; *) dur "alan.img immutable degil";; esac
+		filefrag -v -e "$ALAN" > "$FM" 2>&1
+		esit fiemap "$(awk '/^ *[0-9]+:/{s=$0;gsub(/\.\./," ",s);gsub(/:/," ",s);split(s,x," ");if(!e){i=x[4];if(x[2]!=0)b=1}else if(x[2]!=l+1||x[4]!=p+1)b=1;if(s~/unwritten/)u++;l=x[3];p=x[5];T+=x[6];e++}END{printf "ilk=%s top=%d uw=%d kes=%d\n",i,T,u,b}' "$FM")" "ilk=$PB top=262144 uw=0 kes=0"
+	fi
+	KD=$(cat "$KR/durum" 2>/dev/null); KIP=$(al "$KD" kip); log "E6 kk-alan durum: ${KD:-YOK}"
+	e6k "kk-alan birimleri" sh -c "systemctl is-active kk-alan.service kk-alan-izle.timer systemd-journal-flush.service 2>&1 | tr '\n' ' '; echo; journalctl -b -u kk-alan.service -u kk-alan-izle.service --no-pager -o cat 2>&1 | tail -n 60"
+	e6k "kk-alan durum" /usr/local/sbin/kk-alan durum
+	set -- $(st); log "E6 diskstats: yazma_io=$1 yazma_sektor=$2 discard_io=$3 flush_io=$4"; YS0=$2
+	esit e6-discard "$3" 0
+	esit e6-dmesg "blokred=$(dm 'kk: blok yazma reddedildi') wb=$(dm 'kk: mmc write blocked: ') wb2425=$(dmesg | grep -v 'kk: dmesg:' | grep -c 'mmc write blocked: CMD2[45] ')" "blokred=0 wb=$WBK wb2425=0"
+	esit e6-a12 "kapi=$(sed -n 's/^kapi=\([a-z]*\).*/\1/p' "$KA" 2>/dev/null) red=$(a12r) satir=$(dm 'kk: a12 bdev yazma reddedildi')" "kapi=etkin red=0 satir=0"
+	if [ $MOD = e6 ]; then
+		case $KIP in
+		rw)
+			esit e6-pencere "$(cat "$KY")" "durum=acik bas=$W_BAS son=$W_SON neden=-"
+			LA=$(cat "$KR/loop"); lo6 e6-loop "$LA" 0
+			esit e6-loop-tek "$(lp6 | tr '\n' ' ')" "$LA "
+			esit e6-p68-ro "disk=$(cat $SYS/block/$DSK/ro) p68=$(cat $P/ro)" "disk=0 p68=1"
+			mo=$(findmnt -rn -o SOURCE,FSTYPE,OPTIONS "$AM"); log "E6 bagli: $mo"
+			CO=,commit=30,; case " $(cat /proc/cmdline) " in *" kk_alan_az=1 "*) CO=,commit=300,;; esac	# G53 yazma azaltma (lazytime ayrıca)
+			for o in "$LA ext4 rw," ,noatime, ,errors=remount-ro, "$CO" ,data=ordered,; do case ",$mo," in *"$o"*) ;; *) dur "e6-baglama: '$o' yok ('$mo')";; esac; done
+			[ "$CO" = ,commit=300, ] && { case ",$mo," in *,lazytime,*) ;; *) dur "e6-baglama: lazytime yok ('$mo')";; esac; }
+			case ",$mo," in *,discard,*) dur "e6-baglama: discard acik";; esac
+			case ",$(findmnt -rn -o FS-OPTIONS "$AM")," in *,rw,*) log "ok e6-ust-blok-rw";; *) dur "e6-ust-blok: rw degil (errors=remount-ro?)";; esac
+			esit e6-hata "$(hat)" 0
+			esit e6-bind "$(findmnt -rn -o TARGET "$JD")" "$JD"
+			MID=$(cat /etc/machine-id)
+			esit e6-journald "$([ -e /run/systemd/journal/flushed ] && echo flushed) $([ -f "$JD/$MID/system.journal" ] && echo system.journal)" "flushed system.journal"
+			esit e6-sayac "$(al "$(head -n 1 "$AM$SAYAC")" durum)" ACIK
+			i=0; while [ $i -lt 3 ]; do a=$(lws "$LA"); m=$(st | cut -d' ' -f2); [ "$a" = "$m" ] && break; sleep 1; i=$((i + 1)); done
+			esit e6-kapsam "loop=$a" "loop=$m"
+			esit e6-sinir "$(sin)" "$(cat "$KR/sinir-once")"
+			esit e6-izle "$(systemctl is-active kk-alan-izle.timer)" active
+			log "E6 bilgi: sayac '$(head -n 1 "$AM$SAYAC" | sed 's/ *$//')'"
+			log "E6 bilgi: boots=$(journalctl --list-boots --no-pager 2>/dev/null | wc -l) journal_kib=$(du -sk "$JD" | cut -f1) kullanilan=$(df -k "$AM" | awk 'NR==2{print $3}')KiB ext4_lifetime_kb=$(cat $SYS/fs/ext4/${LA##*/}/lifetime_write_kbytes 2>/dev/null) loop_w_sec=$a"
+			;;
+		ro)
+			esit e6-pencere "$(cat "$KY")" "durum=hazir bas=$W_BAS son=$W_SON neden=-"
+			esit e6-yazma "$YS0" 0
+			LA=$(cat "$KR/loop"); lo6 e6-loop "$LA" 1
+			mo=$(findmnt -rn -o SOURCE,FSTYPE,OPTIONS "$AM"); log "E6 bagli (ro): ${mo:-yok}"
+			[ -z "$mo" ] || case "$mo" in "$LA ext4 ro,"*) ;; *) dur "e6-ro-baglama: '$mo'";; esac
+			esit e6-journald "$([ -e /run/systemd/journal/flushed ] && echo flushed || echo run)" run
+			log "E6 bilgi: neden=$(al "$KD" neden) sayac '$(debugfs -c -R "cat $SAYAC" "$LA" 2>/dev/null | head -n 1 | sed 's/ *$//')' ust: $(dh "$LA")"
+			;;
+		kapali)
+			esit e6-pencere "$(cut -d' ' -f1 "$KY")" durum=kilitli
+			esit e6-loop-yok "$(lp6 | wc -l) $(findmnt -rn "$AM" | wc -l)" "0 0"
+			esit e6-journald "$([ -e /run/systemd/journal/flushed ] && echo flushed || echo run)" run
+			log "E6 bilgi: kapanis nedeni $(al "$KD" neden)"
+			;;
+		*) dur "kk-alan kipi '${KIP:-YOK}' (yok/dur/bozuk): denetlenecek oturum yok";;
+		esac
+		BITTI=1; log "SONUC tamam mod=e6 kip=$KIP yazma_sektor=$YS0"; exit 0
+	fi
+	# --- e6-sifirla: yalnız RO kipinde (SAYAC-DUR / sayac-okunamadi) ve pencere hazırken ---
+	esit e6s-kip "$KIP" ro
+	case "$(al "$KD" neden)" in SAYAC-DUR*|sayac-okunamadi) ;; *) dur "e6s: ro nedeni sifirlanabilir degil: $(al "$KD" neden)";; esac
+	esit e6s-pencere "$(cat "$KY")" "durum=hazir bas=$W_BAS son=$W_SON neden=-"
+	esit e6s-yazma "$YS0" 0
+	LA=$(cat "$KR/loop"); lo6 e6s-ro-loop "$LA" 1
+	esit e6s-ic-kimlik "$(dumpe2fs -h "$LA" 2>/dev/null | sed -n 's/^Filesystem UUID: *//p')" "$IUUID"
+	SK=$(debugfs -c -R "cat $SAYAC" "$LA" 2>/dev/null | head -n 1 | sed 's/ *$//'); log "E6S sayac once: '$SK'"
+	findmnt -rn "$AM" > /dev/null && { umount "$AM" 2>> "$L" || dur "e6s: ro baglama birakilamadi"; }
+	losetup -d "$LA" 2>> "$L" || dur "e6s: ro loop silinemedi"
+	[ -z "$(lp6)" ] || dur "e6s: p68'de ya da diskte loop kaldi"
+	echo "kip=kapali neden=e6-sifirla-basladi up=$(cut -d' ' -f1 /proc/uptime)" > "$KR/durum"; rm -f "$KR/loop"
+	MNT=${KK_MNT6:-/run/kk-anahat-pencere-e6-mnt}; [ -e "$MNT" ] && dur "baglama noktasi zaten var: $MNT"
+	T0=$(cut -d' ' -f1 /proc/uptime); ACILDI=1
+	echo "kk-anahat-pencere: E6 sifirla, pencere aciliyor" > /dev/kmsg 2>/dev/null
+	blockdev --setro "$DEV/$PRT" 2>> "$L" || dur "e6s: p68 setro basarisiz"	# G53 A12-1 (kk-alan B7b ile aynı)
+	esit e6s-p68-ro-bayrak "$(blockdev --getro "$DEV/$PRT" 2>&1)" 1
+	echo ac > "$KY" || dur "ac yazilamadi (rc $?)"
+	esit durum-acik "$(cat "$KY")" "durum=acik bas=$W_BAS son=$W_SON neden=-"
+	esit e6s-ro-acik "disk=$(cat $SYS/block/$DSK/ro) p68=$(cat $P/ro)" "disk=0 p68=1"
+	LW=$(losetup --direct-io=on -o $DOFS --sizelimit $IBOY -f --show "$DEV/$DSK" 2>> "$L"); log "E6S rw loop: '$LW'"
+	case $LW in "$DEV"/loop[0-9]*) ;; *) dur "rw loop kurulamadi";; esac
+	lo6 e6s-rw-loop "$LW" 0
+	printf '[options]\n\tbroken_system_clock = 1\n' > "$EK.conf"
+	E2FSCK_CONFIG=$EK.conf e2fsck -f -p "$LW" > "$EK.e2" 2>&1; er=$?; e6k "e2fsck -f -p rc=$er" cat "$EK.e2"; rm -f "$EK.e2" "$EK.conf"
+	case $er in 0|1) log "ok e6s-e2fsck rc=$er";; *) dur "e6s: e2fsck -f -p rc=$er (BOZUK; -y YOK, onarim ayri onay)";; esac
+	mkdir -m 0700 "$MNT" || dur "mkdir $MNT"; MKD=1; MNTD=1
+	mount -w -t ext4 -o rw,noatime,nodiscard,data=ordered,errors=remount-ro,commit=30,noinit_itable "$LW" "$MNT" 2>> "$L" || dur "mount basarisiz (rc $?)"
+	case "$(findmnt -rn -o SOURCE,FSTYPE,OPTIONS "$MNT")" in "$LW ext4 rw,"*) ;; *) dur "baglama beklenen degil";; esac
+	mkdir -p "$MNT/kk/durum" || dur "mkdir kk/durum"
+	KT=$(al "$SK" kirli_top); [ "$(al "$KD" kirli)" -gt "$(al "$SK" kirli)" ] 2>/dev/null && KT=$((KT + 1))	# ro'ya düşüren kirli kapanış sayılır
+	printf '%-4095s\n' "KKSAYAC 1 kirli=0 duz=0 durum=KAPALI bag=$(al "$SK" bag) kirli_top=$KT son_boot=$(cut -c1-8 /proc/sys/kernel/random/boot_id) son_neden=e6-sifirla up=$(cut -d' ' -f1 /proc/uptime)" > "$TD"
+	dd if="$TD" of="$MNT$SAYAC" bs=4096 count=1 oflag=direct conv=notrunc,fsync 2>> "$L" || dur "sayac yazilamadi"
+	SY=$(sha256sum < "$TD" | cut -c1-64)
+	sync -f "$MNT"; umount "$MNT" 2>> "$L" || dur "umount basarisiz (rc $?)"
+	MNTD=0; rmdir "$MNT" && MKD=0
+	losetup -d "$LW" 2>> "$L" || dur "rw loop silinemedi"; LW=
+	[ -z "$(lp6)" ] || dur "rw loop silindikten sonra p68'de ya da diskte loop var"
+	echo kapat > "$KY"; T1=$(cut -d' ' -f1 /proc/uptime)
+	echo "kk-anahat-pencere: E6 sifirla, pencere kapatildi" > /dev/kmsg 2>/dev/null
+	case "$(cat "$KY")" in durum=kilitli*) ACILDI=0;; *) dur "kapat sonrasi kilitli degil";; esac
+	log "E6S PENCERE acik_sure=$(awk -v a="$T0" -v b="$T1" 'BEGIN{printf "%.2f", b - a}') sn"
+	set -- $(st); log "E6S YAZMA diskstats: yazma_io=$1 yazma_sektor=$2 discard_io=$3 flush_io=$4"
+	[ "$2" -le $YAZ_AZAMI ] || dur "yazma sektoru $2 > $YAZ_AZAMI"
+	esit e6s-discard "$3" 0
+	LR=$(losetup -r --direct-io=on -o $DOFS --sizelimit $IBOY -f --show "$DEV/$DSK" 2>> "$L"); log "E6S ro loop (sonra): '$LR'"
+	case $LR in "$DEV"/loop[0-9]*) ;; *) dur "ro loop (sonra) kurulamadi";; esac
+	lo6 e6s-ro-loop-sonra "$LR" 1
+	e2fsck -fn "$LR" > "$EK.e2" 2>&1; er=$?; e6k "e2fsck -fn (sonra) rc=$er" cat "$EK.e2"; rm -f "$EK.e2"
+	esit e6s-e2fsck-sonra "rc=$er" rc=0
+	esit e6s-ust "$(dh "$LR" | cut -d' ' -f2-3)" "durum=clean kurtarma=0"
+	esit e6s-sayac "$(debugfs -c -R "cat $SAYAC" "$LR" 2>/dev/null | sha256sum | cut -c1-64)" "$SY"
+	losetup -d "$LR" 2>> "$L" || dur "ro loop (sonra) silinemedi"; LR=
+	esit e6s-dmesg "blokred=$(dm 'kk: blok yazma reddedildi') hata=$(hat) a12red=$(a12r)" "blokred=0 hata=0 a12red=0"
+	echo "kip=kapali neden=e6-sifirlandi up=$(cut -d' ' -f1 /proc/uptime)" > "$KR/durum"
+	BITTI=1; log "SONUC tamam mod=e6-sifirla sayac=kirli=0,duz=0,KAPALI yazma_sektor=$(st | cut -d' ' -f2)"; exit 0
+fi
+
+# --- denetle (üç modda da; yalnız okuma) ---
+log "basladi mod=$MOD uname=$(uname -r) up=$(cut -d' ' -f1 /proc/uptime) W=[$W_BAS, $W_SON)"
+case "$(uname -r)" in 6.12.*-kk-g*) ;; *) [ -n "${KK_LOG:-}" ] || dur "uname ana hat degil";; esac
+[ $((W_BAS % 8)) = 0 ] && [ "$W_BAS" -ge "$UD_BAS" ] && [ $((W_SON)) -le $((UD_BAS + UD_BOY)) ] || dur "sabit W_BAS gecersiz"
+esit kk_yazma "$(cat "$KY" 2>&1)" "durum=hazir bas=$W_BAS son=$W_SON neden=-"
+esit dt-aralik "$(q yazma-araligi)" "$W_BAS $W_SAY"
+esit dt-bolum "$(r yazma-bolum) $(q yazma-bolum-no) $(q yazma-bolum-araligi)" "userdata $NO $UD_BAS $UD_BOY"
+esit dt-uuid-kart "$(r yazma-partuuid) $(q kart-sektor)" "$PUUID $KART"
+esit gpt "$(cat $P/start) $(cat $P/size) $(cat $P/partition) $(sed -n 's/^PARTNAME=//p' $P/uevent)" "$UD_BAS $UD_BOY $NO userdata"
+esit kapasite-ro "$(cat $SYS/block/$DSK/size) $(cat $SYS/block/$DSK/ro)" "$KART 1"
+esit dmesg "kati=$(dm 'kk: kati mod acik (DT no-sd)') hazir=$(dm "kk: yazma penceresi HAZIR (kapali) [$W_BAS, $W_SON) bolum=userdata no=$NO") acik=$(dm 'yazma penceresi ACIK') kapali=$(dm 'yazma penceresi KAPALI') blokred=$(dm 'kk: blok yazma reddedildi') wb=$(dm 'kk: mmc write blocked: ') wb2425=$(dmesg | grep -v 'kk: dmesg:' | grep -c 'mmc write blocked: CMD2[45] ')" \
+	"kati=$KATI hazir=1 acik=0 kapali=0 blokred=0 wb=$WBK wb2425=0"
+S0=$(st); esit stat-yazma "$S0" "0 0 0 0"
+if [ "$DOSYA" = 1 ]; then
+	esit kkdata "$(findmnt -rn -o SOURCE,FSTYPE "$KKD")" "/dev/$PRT ext4"
+	case ",$(findmnt -rn -o OPTIONS "$KKD")," in *,ro,*) log "ok kkdata ro";; *) dur "kkdata ro bagli degil";; esac
+	dumpe2fs -h /dev/$PRT 2>/dev/null | grep -q '^Filesystem features:.*needs_recovery' && dur "kkdata needs_recovery"
+	[ -e "$KKD/kk/state/anahat-alan-bozuk" ] && dur "anahat-alan-bozuk isareti var"
+	esit alan-boy "$(stat -c %s "$ALAN")" 1073741824
+	case "$(lsattr -d "$ALAN" | cut -d' ' -f1)" in *i*) log "ok alan immutable";; *) dur "alan.img immutable degil";; esac
+	filefrag -v -e "$ALAN" > "$FM" 2>&1
+	esit fiemap "$(awk '/^ *[0-9]+:/{s=$0;gsub(/\.\./," ",s);gsub(/:/," ",s);split(s,x," ");if(!e){i=x[4];if(x[2]!=0)b=1}else if(x[2]!=l+1||x[4]!=p+1)b=1;if(s~/unwritten/)u++;l=x[3];p=x[5];T+=x[6];e++}END{printf "ilk=%s top=%d uw=%d kes=%d\n",i,T,u,b}' "$FM")" "ilk=$PB top=262144 uw=0 kes=0"
+	# G50: iç fs (testb dahil) artık burada değil, aşağıda SALT OKUNUR loop'tan (alan.img /data sayfa önbelleğiyle okunmaz)
+fi
+set -- $H; n=0
+for o in 0 32768 98304 163840 229376 262143; do
+	a=$(oku4k $DEV/$PRT $((PB + o))); m=$(oku4k $DEV/$DSK $((DB + o)))
+	esit "nokta+$o" "$a $m" "$1 $1"; shift; n=$((n + 1))
+done
+HO=$(oku4k $DEV/$PRT $((PB + HB)) $HN); log "hedef bolge (once) sha256=$HO"
+if [ $MOD = yaz ]; then
+	[ "$HO" = "$DESEN_SHA" ] && dur "hedef bolge zaten desen (onceki E4?); tekrar yazilmaz"
+else
+	esit e4-izi "$HO" "$DESEN_SHA"	# G50: E4 yapıldı (G49); denetle ve e5 E4 izini (hedef = desen) bekler
+fi
+# G50: iç fs YALNIZ salt okunur loop'tan (O_DIRECT): temiz, hiç bağlanmamış, /kk-e5 yok (ikinci E5 yok), hedef bölge boş
+[ -z "$(lp)" ] || dur "p68'e bagli loop zaten var: $(lp | tr '\n' ' ')"
+for t in losetup e2fsck dumpe2fs debugfs; do command -v $t > /dev/null || dur "arac yok: $t"; done
+losetup --help 2>&1 | grep -q -- '--direct-io' || dur "losetup --direct-io yok"
+LR=$(losetup -r --direct-io=on -o $OFS --sizelimit $IBOY -f --show "$DEV/$PRT" 2>> "$L"); log "ICFS ro loop: '$LR'"
+case $LR in "$DEV"/loop[0-9]*) ;; *) dur "ro loop kurulamadi";; esac
+lo_bak ro-loop "$LR" 1
+IH=$(dh "$LR"); log "ICFS once: $IH"
+ek "ic fs kok (once)" debugfs -R "ls -l /" "$LR"
+esit icfs-kk-e5-yok "$(debugfs -R "stat ${E5_YOL%/*}" "$LR" 2>/dev/null | grep -c '^Inode:')" 0
+esit icfs-once "$IH" "ad=kk-anahat durum=clean kurtarma=0 baglama=0"
+e2fsck -fn "$LR" > "$EK.e2" 2>&1; er=$?; ek "e2fsck -fn (once) rc=$er" cat "$EK.e2"; rm -f "$EK.e2"
+esit icfs-e2fsck-once "rc=$er" rc=0
+esit icfs-hedef-bos "$(debugfs -R "testb $HB $HN" "$LR" 2>/dev/null | grep -c 'not in use')" $HN
+losetup -d "$LR" 2>> "$L" || dur "ro loop silinemedi"; LR=
+[ -z "$(lp)" ] || dur "ro loop silindikten sonra p68'de loop var"
+esit stat-yazma-son "$(st)" "0 0 0 0"
+if [ $MOD = denetle ]; then BITTI=1; log "SONUC tamam mod=denetle W_BAS=$W_BAS hedef_once=$HO"; exit 0; fi
+
+# --- e5 (G50): pencere -> rw loop (O_DIRECT) -> iç fs rw -> TEK test dosyası -> umount -> loop sil -> kapat -> salt okunur doğrula ---
+if [ $MOD = e5 ]; then
+	for t in mount umount findmnt dd sha256sum awk sync; do command -v $t > /dev/null || dur "arac yok: $t"; done
+	[ -e "$MNT" ] && dur "baglama noktasi zaten var: $MNT"
+	if command -v systemctl > /dev/null; then
+		log "bilgi fstrim.timer=$(systemctl is-active fstrim.timer 2>&1) fstrim.service=$(systemctl is-active fstrim.service 2>&1) e2scrub_all.timer=$(systemctl is-active e2scrub_all.timer 2>&1) udisks2=$(systemctl is-active udisks2.service 2>&1)"
+		[ "$(systemctl is-active fstrim.service 2>&1)" = active ] && dur "fstrim.service calisiyor"
+	fi
+	awk 'BEGIN{for(i=0;i<8191;i++){s=sprintf("KK-G50-E5 satir=%05d ",i);while(length(s)<511)s=s ".";print s};s="KK-G50-E5 ISARET: ana hattan ilk dosya sistemi yazmasi (G50 E5, tek test dosyasi, 4 MiB, 8192 satir) ";while(length(s)<511)s=s ".";print s}' > "$TD"
+	esit e5-desen "$(stat -c %s "$TD") $(sha256sum < "$TD" | cut -c1-64)" "$E5_BOY $E5_SHA"
+	log "E5 isaret satiri: $(tail -n 1 "$TD" | cut -c1-110)"
+	T0=$(cut -d' ' -f1 /proc/uptime); ACILDI=1
+	echo "kk-anahat-pencere: E5 basliyor, pencere aciliyor" > /dev/kmsg 2>/dev/null
+	echo ac > "$KY" || dur "ac yazilamadi (rc $?)"
+	esit durum-acik "$(cat "$KY")" "durum=acik bas=$W_BAS son=$W_SON neden=-"
+	esit ro-acik "$(cat $SYS/block/$DSK/ro) $(cat $P/ro)" "0 0"
+	LW=$(losetup --direct-io=on -o $OFS --sizelimit $IBOY -f --show "$DEV/$PRT" 2>> "$L"); log "E5 rw loop: '$LW'"
+	case $LW in "$DEV"/loop[0-9]*) ;; *) dur "rw loop kurulamadi";; esac
+	lo_bak rw-loop "$LW" 0
+	esit icfs-acik "$(dh "$LW")" "ad=kk-anahat durum=clean kurtarma=0 baglama=0"
+	kes loop
+	mkdir -m 0700 "$MNT" || dur "mkdir $MNT"
+	MKD=1
+	esit rw-loop-bagli-degil "$(grep -c "^$LW " /proc/mounts)" 0
+	MNTD=1
+	mount -w -t ext4 -o rw,noatime,nodiscard,noinit_itable,data=ordered,errors=remount-ro "$LW" "$MNT" 2>> "$L" || dur "mount basarisiz (rc $?)"
+	mo=$(findmnt -rn -o SOURCE,FSTYPE,OPTIONS "$MNT"); log "E5 bagli: $mo"
+	case "$mo" in "$LW ext4 rw,"*) ;; *) dur "baglama beklenen degil: '$mo'";; esac
+	kes mount
+	[ -e "$MNT${E5_YOL%/*}" ] && dur "${E5_YOL%/*} zaten var"
+	mkdir "$MNT${E5_YOL%/*}" || dur "mkdir ${E5_YOL%/*}"
+	dd if="$TD" of="$MNT$E5_YOL" bs=1048576 conv=excl,fsync 2>> "$L" || dur "dd basarisiz (rc $?)"
+	sync "$MNT${E5_YOL%/*}" && sync -f "$MNT" || dur "sync basarisiz"
+	log "E5 YAZILDI: $(stat -c '%n boy=%s inode=%i' "$MNT$E5_YOL")"
+	kes yaz
+	umount "$MNT" 2>> "$L" || dur "umount basarisiz (rc $?)"
+	MNTD=0; rmdir "$MNT" && MKD=0
+	esit ayrildi "$(grep -c " $MNT " /proc/mounts) $(grep -c "^$LW " /proc/mounts)" "0 0"
+	kes umount
+	losetup -d "$LW" 2>> "$L" || dur "rw loop silinemedi"; LW=
+	[ -z "$(lp)" ] || dur "rw loop silindikten sonra p68'de loop var"
+	echo kapat > "$KY"; kr=$?; T1=$(cut -d' ' -f1 /proc/uptime)
+	echo "kk-anahat-pencere: E5 pencere kapatildi" > /dev/kmsg 2>/dev/null
+	AS=$(awk -v a="$T0" -v b="$T1" 'BEGIN{printf "%.2f", b - a}')
+	log "PENCERE kapat rc=$kr; kk_yazma: $(cat "$KY"); acik_sure=$AS sn"
+	case "$(cat "$KY")" in durum=kilitli*) ACILDI=0;; *) dur "kapat sonrasi kilitli degil";; esac
+	esit ro-kapali "$(cat $SYS/block/$DSK/ro)" 1
+	# --- doğrulama (pencere KAPALI, kilitli; yalnız okuma) ---
+	S1=$(st); set -- $S1; YIO=$1; YSEK=$2; DIO=$3; FIO=$4
+	log "E5 YAZMA diskstats: yazma_io=$YIO yazma_sektor=$YSEK ($((YSEK * 512)) B) discard_io=$DIO flush_io=$FIO"
+	[ "$YSEK" -ge $((E5_BOY / 512)) ] && [ "$YSEK" -le $YAZ_AZAMI ] || dur "yazma sektoru $YSEK [$((E5_BOY / 512)), $YAZ_AZAMI] disinda"
+	esit discard-io "$DIO" 0
+	esit dmesg-sonra "acik=$(dm "kk: yazma penceresi ACIK [$W_BAS, $W_SON)") kapali=$(dm 'kk: yazma penceresi KAPALI, kilitli (sysfs)') blokred=$(dm 'kk: blok yazma reddedildi') wb=$(dm 'kk: mmc write blocked: ') wb2425=$(dmesg | grep -v 'kk: dmesg:' | grep -c 'mmc write blocked: CMD2[45] ') hata=$(dmesg | grep -v 'kk: dmesg:' | grep -ciE 'I/O error|EXT4-fs (error|warning)|Buffer I/O|recovery failed|HW reset card|mmc[0-9]+: .*timeout|remounting filesystem read-only|JBD2: .*(error|abort)')" \
+		"acik=1 kapali=1 blokred=0 wb=$WBK wb2425=0 hata=0"
+	ek "dmesg ext4/loop/kk satirlari" sh -c "dmesg | grep -v 'kk: dmesg:' | grep -E 'EXT4-fs \(loop|loop[0-9]+:|yazma penceresi|kk-anahat-pencere' | tail -n 20"
+	LR=$(losetup -r --direct-io=on -o $OFS --sizelimit $IBOY -f --show "$DEV/$PRT" 2>> "$L"); log "ICFS ro loop (sonra): '$LR'"
+	case $LR in "$DEV"/loop[0-9]*) ;; *) dur "ro loop (sonra) kurulamadi";; esac
+	lo_bak ro-loop-sonra "$LR" 1
+	e2fsck -fn "$LR" > "$EK.e2" 2>&1; er=$?; ek "e2fsck -fn (sonra) rc=$er" cat "$EK.e2"; rm -f "$EK.e2"
+	esit icfs-e2fsck-sonra "rc=$er" rc=0
+	esit icfs-sonra "$(dh "$LR")" "ad=kk-anahat durum=clean kurtarma=0 baglama=1"
+	ek "ic fs kok (sonra)" debugfs -R "ls -l /" "$LR"
+	ek "ic fs /kk-e5 (sonra)" debugfs -R "ls -l ${E5_YOL%/*}" "$LR"
+	ek "dumpe2fs -h (sonra)" dumpe2fs -h "$LR"
+	esit e5-dosya "$(debugfs -R "stat $E5_YOL" "$LR" 2>/dev/null | sed -n 's/.*Size: \([0-9]*\).*/\1/p' | head -n 1) $(debugfs -R "cat $E5_YOL" "$LR" 2>/dev/null | sha256sum | cut -c1-64)" "$E5_BOY $E5_SHA"
+	BL=$(debugfs -R "blocks $E5_YOL" "$LR" 2>/dev/null); ek "e5 dosya bloklari" echo "$BL"
+	esit e5-bloklar "$(echo $BL | awk -v h=$HB -v n=$HN '{for(i=1;i<=NF;i++){b=$i;c++;if(b>=h&&b<h+n)e++;if(b==0||b==32768||b==98304||b==163840||b==229376||b==262143)k++;if(c==1||b<a)a=b;if(b>z)z=b}}END{printf "say=%d e4=%d nokta=%d\n",c,e,k}')" "say=$((E5_BOY / 4096)) e4=0 nokta=0"
+	log "E5 dosya bloklari: $(echo $BL | awk '{a=$1;z=$1;for(i=2;i<=NF;i++){if($i<a)a=$i;if($i>z)z=$i}printf "en_kucuk=%s en_buyuk=%s say=%d", a, z, NF}')"
+	esit e4-dilim-sonra "$(oku4k $DEV/$PRT $((PB + HB)) $HN) $(oku4k "$LR" $HB $HN)" "$DESEN_SHA $DESEN_SHA"
+	esit icfs-hedef-bos-sonra "$(debugfs -R "testb $HB $HN" "$LR" 2>/dev/null | grep -c 'not in use')" $HN
+	set -- $H; NS=
+	for o in 0 32768 98304 163840 229376 262143; do
+		a=$(oku4k $DEV/$PRT $((PB + o))); m=$(oku4k $DEV/$DSK $((DB + o))); c=$(oku4k "$LR" $o)
+		[ "$a" = "$m" ] && [ "$a" = "$c" ] || dur "nokta-sonra+$o: p68/disk/loop farkli ($a $m $c)"
+		case $o in 0|262143) log "bilgi nokta-sonra+$o = $a ($([ "$a" = "$1" ] && echo ayni || echo degisti))"; NS="$NS $o:$([ "$a" = "$1" ] && echo ayni || echo degisti)";;
+		*) esit "yedek-superblok+$o" "$a" "$1";; esac
+		shift
+	done
+	losetup -d "$LR" 2>> "$L" || dur "ro loop (sonra) silinemedi"; LR=
+	[ -z "$(lp)" ] || dur "dogrulamadan sonra p68'de loop var"
+	esit ac-tekrar "$(echo ac > "$KY" 2>/dev/null && echo acildi || echo red) $(cat "$KY" | cut -d' ' -f1)" "red durum=kilitli"
+	esit stat-dogrulama-yazmadi "$(st)" "$S1"
+	BITTI=1
+	log "E5 SONUC dosya=$E5_YOL sha256=$E5_SHA yazma_sektor=$YSEK yazma_io=$YIO discard=$DIO flush=$FIO acik_sure=${AS}sn noktalar:$NS"
+	log "SONUC tamam mod=e5 W_BAS=$W_BAS e5_sha=$E5_SHA yazma_sektor=$YSEK acik_sure=${AS}sn"
+	exit 0
+fi
+
+# --- yaz (E4): desen -> ac -> tek O_DIRECT yazma -> kapat -> doğrula ---
+HS=$((W_BAS + HB * 8))
+awk -v b=$HS 'BEGIN{for(i=0;i<2048;i++){s=sprintf("KK-G48-E4 sektor=%010d ",b+i);while(length(s)<511)s=s ".";print s}}' > "$DS"
+esit desen "$(stat -c %s "$DS") $(sha256sum < "$DS" | cut -c1-64)" "1048576 $DESEN_SHA"
+ACILDI=1
+echo ac > "$KY" || dur "ac yazilamadi (rc $?)"
+esit durum-acik "$(cat "$KY")" "durum=acik bas=$W_BAS son=$W_SON neden=-"
+log "YAZMA basliyor: $DEV/$PRT blok $((PB + HB))+$HN (mutlak sektor $HS..$((HS + 2047)))"
+dd if="$DS" of=$DEV/$PRT bs=4096 seek=$((PB + HB)) count=$HN oflag=direct conv=notrunc,fsync 2>> "$L"; yr=$?
+echo kapat > "$KY"; kr=$?
+log "YAZMA dd rc=$yr; kapat rc=$kr; kk_yazma: $(cat "$KY")"
+case "$(cat "$KY")" in durum=kilitli*) ACILDI=0;; *) dur "kapat sonrasi kilitli degil";; esac
+[ $yr = 0 ] || dur "yazma basarisiz (dd rc $yr)"
+S1=$(st); set -- $S1
+esit stat-fark "$1 $2 $3 $4" "$1 2048 0 0"
+[ "$1" -ge 1 ] || dur "yazma_io 0"
+sync; echo 3 > /proc/sys/vm/drop_caches
+esit geri-p68 "$(oku4k $DEV/$PRT $((PB + HB)) $HN)" $DESEN_SHA
+esit geri-disk "$(oku4k $DEV/$DSK $((DB + HB)) $HN)" $DESEN_SHA
+[ "$DOSYA" = 1 ] && esit geri-dosya "$(oku4k "$ALAN" $HB $HN)" $DESEN_SHA
+set -- $H
+for o in 0 32768 98304 163840 229376 262143; do esit "nokta-sonra+$o" "$(oku4k $DEV/$PRT $((PB + o))) $(oku4k $DEV/$DSK $((DB + o)))" "$1 $1"; shift; done
+esit dmesg-sonra "acik=$(dm "kk: yazma penceresi ACIK [$W_BAS, $W_SON)") kapali=$(dm 'kk: yazma penceresi KAPALI, kilitli (sysfs)') blokred=$(dm 'kk: blok yazma reddedildi') wb=$(dm 'kk: mmc write blocked: ') wb2425=$(dmesg | grep -v 'kk: dmesg:' | grep -c 'mmc write blocked: CMD2[45] ') hata=$(dmesg | grep -v 'kk: dmesg:' | grep -ciE 'I/O error|EXT4-fs error|Buffer I/O|recovery failed|HW reset card|mmc[0-9]+: .*timeout')" \
+	"acik=1 kapali=1 blokred=0 wb=$WBK wb2425=0 hata=0"
+esit ac-tekrar "$(echo ac > "$KY" 2>/dev/null && echo acildi || echo red) $(cat "$KY" | cut -d' ' -f1)" "red durum=kilitli"
+BITTI=1
+log "DESEN sha256=$DESEN_SHA sektor=$HS+2048 stat=$S1"
+log "SONUC tamam mod=yaz W_BAS=$W_BAS hedef_once=$HO hedef_sonra=$DESEN_SHA"
+exit 0
+#--- CIHAZ SONU ---

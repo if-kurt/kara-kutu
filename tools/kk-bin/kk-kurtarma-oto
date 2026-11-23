@@ -1,0 +1,210 @@
+#!/bin/bash
+# Kara Kutu kk-bin (G59-F ÖNERİSİ; kk-fb-oluadam deseni): kurtarma ortamı otomatik dönüşü. kullanıcı crontab'ından 5 dk'da bir; argümansız.
+# Kural: cihaz kurtarma ortamında (v5.1e, telnet 172.16.42.1:23 açık; 22/2222/2323 kapalı; fastboot'ta DEĞİL) ESIK sn (1200)
+#   KESİNTİSİZ kalmış VE son ESIK sn'de İZLEME DIŞI hiçbir kk-bin çağrısı yoksa, sırayla (her biri öncekinin başarısına bağlı):
+#     kk-kurtarma aktar  ->  kk-kurtarma bfr  ->  kk-kurtarma reboot 2222
+#   Başarı yalnız çıkış koduna bakılmaz (kk-kurtarma bfr'in çıkışı tee'nin 0'ıdır): aktar "aktarim OK" satırı; bfr "betik cikis=0",
+#   "misc = temel deger: OK", DUR/UYARI satırı yok; reboot çıkış 5 (= 2222 SSH geldi). Biri tutmazsa DUR (sonraki adım yok), log'a.
+#   Son adımın sonucu (2222 geldi mi, VERIAYIR=…) log'a ve kk-bin.log'a.
+# Gözlem (salt okuma; yeni cihaz komutu yok): `timeout 10 fastboot devices` (kural 5; yalnız bu fastboot komutu) + `nc -z -w 2` ile
+#   172.16.42.1 portları 23/22/2222/2323 (kk-izle ve kk-kurtarma'nın kullandığı yoklama). Kurtarma = 23 açık VE 22/2222/2323 kapalı
+#   VE fastboot'ta değil. Fastboot'taysa ya da fastboot yoklaması takılırsa hiçbir şey yapılmaz (kk-fb-oluadam'ın alanı).
+#   NOT: v5.1 (4.9) açılışında telnetd 23 geçici açıktır (switch_root'a dek); 20 dk kesintisizlik ölçütü bunu eler.
+# Sessizlik (kk-fb-oluadam ile AYNI; G58 izleme ayrımı): IZLEME araçları (kk-anahat-saglik kk-anahat-olcum kk-anahat-pstore-al)
+#   sessizliği bozmaz. Sessizlik = en yeni şu ikisi: (i) kk-bin.log'un son 1 MiB'ında [ad] etiketi IZLEME'de olmayan zaman damgalı
+#   satırların en yenisi (zaman damgasız satır kendinden sonraki damgalı satırın zamanını, dosya sonundaysa log mtime'ını alır;
+#   izleme dışı satır yoksa pencerenin en eski damgası, hiç damga yoksa log mtime'ı); (ii) kk-bin.kilit mtime'ı (son sahip
+#   IZLEME'de ise sayılmaz). Belirsizlik hep "bekle" yönüne çözülür.
+# Kendi çağrılarımız: EYLEM'den önce bu kalış için deneme kaydı (dn=1) ve 24 sa listesi yazılır; kk-kurtarma/kk-izle/kk-kurtarma-oto
+#   satırları kk-bin.log'a düşer ve "izleme dışı" sayılır AMA aynı kalışta tekrar yok (dn=1) ve yeni kalış eylemin bitişinden
+#   sonra başlar: ESIK >= 1200 olduğundan kendi satırlarımız hiçbir kalışta kendimizi kilitleyemez, ayrıca özel ayrım gerekmez.
+# Kalış: ardışık iki tur arası > BOSLUK sn (600) ise kalış yeniden başlar. Cihaz kurtarmada GÖRÜLMEYİNCE (2222'ye geçti, fastboot,
+#   Debian...) kalış biter ve deneme hakkı yenilenir. Kilit dolu / takılma / kapatma kalışı sıfırlar ama hakkı geri vermez.
+# Sınırlar: her kalışta en çok 1 deneme (başarısızsa tekrar yok); 24 saatte en çok SINIR24 (2) deneme (kayıt gelecekte -> deneme yok).
+# Kilit: ortak kk-bin kilidi (work/kk-bin-log/kk-bin.kilit, fd 9, flock -n) kk_kilit ÇAĞRILMADAN alınır (kk-bin.log'a rutin satır
+#   YAZILMAZ). Kilit doluysa: sahibi CANLI bir IZLEME aracıysa kalış KORUNUR, bu tur gözlem/eylem yok (.atla'ya tur zamanı);
+#   aksi hâlde kalış sıfırlanır. Eylemde kk-kurtarma fd 9'u miras alır (kk_kilit "miras"); fd 8 çocuklara geçmez.
+#   Eylem boyunca (<= ~12 dk) kilit bizde: sonraki cron turu fd 8 (.durum.kilit) yüzünden "onceki calisma suruyor" der.
+# Her adım zaman aşımlı (timeout -k 5): aktar ZA_AKTAR, bfr ZA_BFR, reboot ZA_REBOOT sn.
+# Rutin kararlar yalnız kk-kurtarma-oto.log'a. Kapatma: work/kk-bin-log/kk-kurtarma-oto.kapali.
+# Çıkış hep 0 (cron). Kurmak/değiştirmek bakımcının onayını gerektirir.
+set -u
+# --- SABITLER (ortam değişkeniyle yol/eşik değiştirme kapısı YOK) ---
+PATH=/usr/local/bin:/usr/bin:/bin
+KB=/opt/kara-kutu/tools/kk-bin
+SERI=${KK_SERI:?KK_SERI ortam degiskeni (fastboot seri no) gerekli}
+H=172.16.42.1
+LD=/opt/kara-kutu/work/kk-bin-log
+ZA_AKTAR=600; ZA_BFR=240; ZA_REBOOT=420
+# --- SABITLER SONU ---
+KK=$KB/kk-kurtarma
+KK_KILIT=$LD/kk-bin.kilit
+KKLOG=$LD/kk-bin.log
+OLOG=$LD/kk-kurtarma-oto.log
+DURUM=$LD/kk-kurtarma-oto.durum
+DENEME=$LD/kk-kurtarma-oto.denemeler
+KAPALI=$LD/kk-kurtarma-oto.kapali
+ATLA=$LD/kk-kurtarma-oto.atla
+CIKTI=$LD/kk-kurtarma-oto.cikti
+IZLEME=' kk-anahat-saglik kk-anahat-olcum kk-anahat-pstore-al '
+ESIK=1200; BOSLUK=600; SINIR24=2; PENCERE=1048576
+
+[ $# -eq 0 ] || { echo "kullanim: kk-kurtarma-oto (argumansiz; cron)" >&2; exit 64; }
+mkdir -p "$LD" || exit 0
+log() { echo "$(date -u '+%F %T') UTC [kk-kurtarma-oto] $*" >> "$OLOG"; }
+sayi() { case ${1:-} in ''|*[!0-9]*) return 1;; esac; [ ${#1} -le 12 ]; }
+izleme_adi() { case $IZLEME in *" ${1:-.} "*) return 0;; esac; return 1; }
+kilit_betik() { sed -n '1s/^pid=[0-9]* betik=\([^ ]*\) .*/\1/p' "$KK_KILIT" 2>/dev/null | head -c 64; }
+izleme_sahibi() {	# kilidi tutan canlı bir IZLEME aracı mı? (içerik "pid=N betik=AD ..."; /proc/N/cmdline'da .../AD)
+	local l p ad a
+	l=$(head -n 1 "$KK_KILIT" 2>/dev/null | head -c 200)
+	[[ $l =~ ^pid=([0-9]{1,9})\ betik=([^ ]+)\  ]] || return 1
+	p=${BASH_REMATCH[1]}; ad=${BASH_REMATCH[2]}
+	izleme_adi "$ad" || return 1
+	[ -r "/proc/$p/cmdline" ] || return 1
+	while IFS= read -r -d '' a; do [ "${a##*/}" = "$ad" ] && return 0; done < "/proc/$p/cmdline"
+	return 1
+}
+if [ -f "$OLOG" ] && [ "$(stat -c %s "$OLOG" 2>/dev/null || echo 0)" -gt 2097152 ]; then mv -f "$OLOG" "$OLOG.1"; fi
+
+# 1) Kendi eşzamanlılık kilidi (önceki çalışma, ör. eylem sürüyorsa hiçbir şeye dokunmadan çık).
+exec 8>>"$DURUM.kilit" && flock -n 8 || { log "onceki calisma suruyor; cikis"; exit 0; }
+
+now=$(date +%s); sayi "$now" || { log "HATA: saat okunamadi"; exit 0; }
+# 2) Durum: "kalis_bas son_gozlem denendi son_calisma" + .atla: son izleme-kilidi turu
+kb=0; sg=0; dn=0
+if [ -e "$DURUM" ]; then
+	read -r a b c _ x < "$DURUM" 2>/dev/null
+	if sayi "${a:-}" && sayi "${b:-}" && { [ "${c:-}" = 0 ] || [ "${c:-}" = 1 ]; } && [ -z "${x:-}" ]; then kb=$a; sg=$b; dn=$c
+	else log "UYARI: durum bozuk; kalis sifirlandi, bu kalista deneme YOK sayildi (tutucu)"; kb=0; sg=0; dn=1; fi
+fi
+kaydet() { printf '%s %s %s %s\n' "$kb" "$sg" "$dn" "$now" > "$DURUM.tmp" && mv -f "$DURUM.tmp" "$DURUM"; }
+if [ "$kb" -gt "$now" ] || [ "$sg" -gt "$now" ]; then log "UYARI: saat geri gitmis (durum > simdi); kalis sifirlandi"; kb=0; sg=0; fi
+sa=0
+if [ -e "$ATLA" ]; then
+	read -r y x < "$ATLA" 2>/dev/null
+	if sayi "${y:-}" && [ -z "${x:-}" ] && [ "$y" -le "$now" ]; then sa=$y; else log "UYARI: atla kaydi bozuk/ileri; yok sayildi (bosluk son gozlemden)"; fi
+fi
+ref=$sg; [ "$sa" -gt "$ref" ] && ref=$sa	# son tur (gözlem ya da izleme-kilidi turu)
+
+# 3) Kapatma
+if [ -e "$KAPALI" ]; then
+	[ "$kb" -gt 0 ] && log "KAPALI ($KAPALI var): kalis sifirlandi"
+	kb=0; kaydet; exit 0
+fi
+
+# 4) Ortak kk-bin kilidi (kk_kilit çağrılmaz; kk-bin.log'a yazılmaz)
+if ! { exec 9>>"$KK_KILIT" && flock -n 9; }; then
+	sh=$(head -c 120 "$KK_KILIT" 2>/dev/null | tr -d '\n')
+	if izleme_sahibi; then
+		if [ "$kb" -gt 0 ] && [ $((now - ref)) -gt "$BOSLUK" ]; then
+			log "kk-bin kilidi izleme aracinda (sahip: $sh); tur boslugu $((now - ref)) sn > $BOSLUK: kalis sifirlandi"; kb=0; kaydet
+		elif [ "$kb" -gt 0 ]; then
+			log "kk-bin kilidi izleme aracinda (sahip: $sh): kalis korunuyor ($((now - kb)) sn); gozlem/eylem yok, sonraki tur"
+		else
+			log "kk-bin kilidi izleme aracinda (sahip: $sh): kalis yok; gozlem yok, sonraki tur"
+		fi
+		echo "$now" > "$ATLA.tmp" && mv -f "$ATLA.tmp" "$ATLA"
+		exit 0
+	fi
+	log "kk-bin kilidi dolu (kk-bin calisiyor; sahip: $sh): kalis sifirlandi"
+	kb=0; kaydet; exit 0
+fi
+
+# 5) Gözlem: fastboot devices + nc -z yoklamaları (zaman aşımlı; fd 8/9 çocuğa geçmez)
+out=$(timeout -k 2 10 fastboot devices 2>/dev/null 8>&- 9>&-); r=$?
+if [ $r -ne 0 ]; then
+	log "fastboot devices basarisiz/takildi (rc=$r): belirsiz, kalis sifirlandi"; kb=0; kaydet; exit 0
+fi
+dur=kurtarma
+if printf '%s\n' "$out" | grep -qE "^$SERI[[:space:]]+fastboot([[:space:]]|\$)"; then dur="fastboot'ta"
+elif ! nc -z -w 2 "$H" 23 8>&- 9>&- 2>/dev/null; then dur="telnet 23 kapali"
+else
+	for p in 22 2222 2323; do
+		if nc -z -w 2 "$H" "$p" 8>&- 9>&- 2>/dev/null; then dur="port $p acik (kurtarma degil)"; break; fi
+	done
+fi
+if [ "$dur" != kurtarma ]; then
+	{ [ "$kb" -gt 0 ] || [ "$dn" = 1 ]; } && log "cihaz kurtarmada degil ($dur): kalis bitti (deneme hakki yenilendi)"
+	kb=0; sg=0; dn=0; kaydet; exit 0
+fi
+
+# 6) Kurtarmada
+if [ "$kb" -eq 0 ]; then kb=$now; log "kurtarma kalisi basladi"
+elif [ $((now - ref)) -gt "$BOSLUK" ]; then log "tur boslugu $((now - ref)) sn > $BOSLUK: kalis yeniden basliyor"; kb=$now; fi
+sg=$now; kaydet
+sure=$((now - kb))
+# Son İZLEME DIŞI kk-bin zamanı (mt) ve kaynağı
+mt=0; kay=yok
+en_yeni() { sayi "${1:-}" && [ "$1" -gt "$mt" ] && { mt=$1; kay=$2; }; return 0; }
+lm=$(stat -c %Y "$KKLOG" 2>/dev/null)
+s=$(tail -c "$PENCERE" "$KKLOG" 2>/dev/null 8>&- 9>&- | awk -v iz="$IZLEME" '
+	NR == 1 { next }
+	/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9](\.[0-9]+)? UTC \[[^] ]+\]/ {
+		t = substr($0, 1, 19); a = $0; sub(/^[^[]*\[/, "", a); sub(/\].*$/, "", a)
+		if (ilk == "" || t < ilk) ilk = t
+		if (bek || index(iz, " " a " ") == 0) { if (t > son) son = t }
+		bek = 0; next
+	}
+	{ bek = 1 }
+	END { if (bek) print "SON-DAMGASIZ"; else if (son != "") print son " satir"; else if (ilk != "") print ilk " pencere-basi"; else print "YOK" }' 8>&- 9>&-)
+case $s in
+	*" satir"|*" pencere-basi")
+		e=$(date -u -d "${s% *}" +%s 2>/dev/null)
+		if sayi "$e"; then en_yeni "$e" "log-${s##* }"; else en_yeni "$lm" log-mtime; fi;;
+	*) en_yeni "$lm" log-mtime;;
+esac
+ka=$(kilit_betik)
+izleme_adi "$ka" || en_yeni "$(stat -c %Y "$KK_KILIT" 2>/dev/null)" "kilit(${ka:-?})"
+yas=$((now - mt))
+[ "$sure" -ge "$ESIK" ] || { log "kurtarmada ${sure}/${ESIK} sn; son izleme disi kk-bin ${yas} sn once ($kay); bekle"; exit 0; }
+[ "$yas" -ge "$ESIK" ] || { log "kurtarmada ${sure} sn ama son izleme disi kk-bin ${yas} sn once ($kay; < $ESIK); bekle"; exit 0; }
+[ "$dn" = 0 ] || { log "kurtarmada ${sure} sn; bu kalista deneme yapildi: tekrar YOK (elle mudahale gerekir)"; exit 0; }
+n24=0; ileri=0; bozuk=0
+if [ -e "$DENEME" ]; then
+	while read -r e x; do
+		sayi "${e:-}" && [ -z "${x:-}" ] || { bozuk=1; continue; }
+		[ "$e" -gt $((now + 60)) ] && ileri=1
+		[ $((now - e)) -lt 86400 ] && n24=$((n24 + 1))
+	done < "$DENEME"
+fi
+[ "$bozuk" = 0 ] || { log "SINIR: deneme kaydi bozuk ($DENEME); deneme YOK (elle duzeltilmeli)"; exit 0; }
+[ "$ileri" = 0 ] || { log "SINIR: saat geri gitmis (deneme kaydi > simdi); deneme YOK"; exit 0; }
+[ "$n24" -lt "$SINIR24" ] || { log "DUR: 24 saatte $n24 deneme doldu (en cok $SINIR24); deneme YOK"; exit 0; }
+
+# 7) EYLEM: önce kayıt (bu kalış denendi + 24 s listesi), sonra aktar -> bfr -> reboot 2222 (fd 9 miras).
+dn=1; kaydet; echo "$now" >> "$DENEME"; sync
+log "EYLEM: kurtarmada ${sure} sn, son izleme disi kk-bin ${yas} sn once ($kay), 24s=$n24 -> aktar, bfr, reboot 2222"
+echo "$(date -u '+%F %T.%3N') UTC [kk-kurtarma-oto] EYLEM: ${sure} sn kurtarma ortami, ${yas} sn izleme disi kk-bin yok -> kk-kurtarma aktar, bfr, reboot 2222 (cron, tek deneme)" >> "$KKLOG"
+export KK_KILIT_SAHIBI="pid=$$ kk-kurtarma-oto"
+adim() {	# adim <zaman> <arg...>: kk-kurtarma'yı zaman aşımlı çalıştır; çıktı CIKTI'da ve log'da; dönüş = çıkış kodu
+	local za=$1; shift
+	timeout -k 5 "$za" "$KK" "$@" > "$CIKTI" 2>&1 8>&-; local rc=$?
+	cat "$CIKTI" >> "$OLOG"; return $rc
+}
+son() {	# son <metin>: sonuç hem kendi log'una hem kk-bin.log'a
+	log "$1"; echo "$(date -u '+%F %T.%3N') UTC [kk-kurtarma-oto] $1" >> "$KKLOG"
+}
+adim "$ZA_AKTAR" aktar; r=$?
+if [ $r -ne 0 ] || ! grep -q '\[kk-kurtarma\] aktarim OK' "$CIKTI"; then
+	son "DUR: aktar basarisiz (cikis=$r; 124 zaman asimi; 'aktarim OK' satiri $(grep -c '\[kk-kurtarma\] aktarim OK' "$CIKTI")): bfr/reboot YAPILMADI"; exit 0
+fi
+log "aktar OK"
+adim "$ZA_BFR" bfr; r=$?
+# G59 gerçek sınama (02:16): bilerek 0x08 ile girilen kurtarmada BFR bayrağı yok -> bfr-temizle-g23.sh çıkış 11
+#   ("DUR: misc boot-erecovery degil"; hiçbir şey yazmaz). Bu YALNIZ şu üçü birlikteyse "bayrak yok, bfr atlandi" sayılır:
+#   kk-kurtarma çıkışı 0, betik cikis=11 + o DUR satırı, hiç dd/ONCE/SONRA satırı yok. Çıkış 12 (misc bayraklı, rrecord
+#   değil) ve diğer her şey DUR olarak kalır.
+if [ $r -eq 0 ] && grep -qE 'betik cikis=11[[:space:]]*$' "$CIKTI" && grep -q '^DUR: misc boot-erecovery degil' "$CIKTI" \
+	&& ! grep -qE '^(misc dd|rrecord dd|ONCE|SONRA|UYARI)' "$CIKTI"; then
+	log "bfr: BFR bayragi yok (misc boot-erecovery degil; betik hicbir sey yazmadi): bfr atlandi"
+elif [ $r -ne 0 ] || ! grep -qE 'betik cikis=0[[:space:]]*$' "$CIKTI" || ! grep -q '^misc = temel deger: OK' "$CIKTI" || grep -qE '^(DUR|UYARI)' "$CIKTI"; then
+	son "DUR: bfr basarisiz (cikis=$r; betik cikis: $(grep -oE 'betik cikis=[0-9]+' "$CIKTI" | head -n 1)): reboot YAPILMADI"; exit 0
+else
+	log "bfr OK"
+fi
+adim "$ZA_REBOOT" reboot 2222; r=$?
+va=$(grep -o 'VERIAYIR=[A-Za-z-]*' "$CIKTI" | head -n 1)
+if [ $r -eq 5 ]; then son "reboot 2222: 2222 GELDI (cikis=5; ${va:-VERIAYIR=okunamadi})"
+else son "reboot 2222: 2222 GELMEDI (cikis=$r; 9 sure doldu, 124 zaman asimi; ${va:-VERIAYIR=okunamadi}): tekrar YOK, elle mudahale"; fi
+exit 0

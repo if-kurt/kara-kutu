@@ -1,0 +1,61 @@
+#!/bin/bash
+# Kara Kutu kk-bin: imajı YALNIZ `kernel` bölümüne, YALNIZ -s <CIHAZ_SERI> ile yaz. Reboot YAPMAZ.
+#   kk-flash-kernel <imaj-yolu> <beklenen-sha256>
+# Denetimler (biri tutmazsa YAZMADAN çıkar):
+#   - tam 2 argüman; sha 64 küçük onaltılık hane;
+#   - imaj gerçek yolu /opt/kara-kutu/work/ altında ya da tam olarak kk-backup/kernel.img / kk-ek/stok/stok-kernel.img;
+#   - normal dosya, 0 < boyut <= 25 165 824 B (kernel bölümü), ilk 8 bayt "ANDROID!";
+#   - imaj özel bir geçici kopyaya alınır; boyut, magic ve sha kopyada denetlenir ve yazılan da o kopyadır;
+#   - cihaz bu seriyle fastboot modunda görünmeli.
+# Her adım ve sha /opt/kara-kutu/work/kk-bin-log/kk-bin.log'a yazılır. Değiştirmek bakımcının onayını gerektirir.
+# G50 (bakımcı onayı (i), G49 önerisi): ortak kk-bin kilidi (flock -n, work/kk-bin-log/kk-bin.kilit, fd 9); doluysa çıkış 77, hiçbir şey yapılmaz.
+set -u
+SERI=${KK_SERI:?KK_SERI ortam degiskeni (fastboot seri no) gerekli}; BOLUM_BOY=25165824
+LOG=/opt/kara-kutu/work/kk-bin-log/kk-bin.log; mkdir -p "${LOG%/*}"
+log() { echo "$(date -u '+%F %T.%3N') UTC [kk-flash-kernel] $*" | tee -a "$LOG"; }
+[ $# -eq 2 ] || { echo "kullanim: kk-flash-kernel <imaj-yolu> <beklenen-sha256>" >&2; exit 64; }
+WANT=$2
+[[ $WANT =~ ^[0-9a-f]{64}$ ]] || { log "DUR: sha bicimi gecersiz"; exit 64; }
+IMG=$(realpath -e -- "$1" 2>/dev/null) || { log "DUR: imaj yok: $1"; exit 64; }
+case $IMG in
+	/opt/kara-kutu/work/*|/opt/kara-kutu/kk-backup/kernel.img|/opt/kara-kutu/kk-ek/stok/stok-kernel.img) ;;
+	*) log "DUR: izinli yer disinda: $IMG"; exit 64;;
+esac
+[ -f "$IMG" ] || { log "DUR: normal dosya degil: $IMG"; exit 64; }
+# --- G49 ortak kilit (kural 17'nin mekanik karşılığı): cihaza dokunan kk-bin çağrıları tek tek. ---
+# flock, work/kk-bin-log/kk-bin.kilit üzerinde, fd 9. Bekleme YOK (-n): kilit doluysa hemen 77, cihaz işlemi yapılmaz.
+# Miras: iç içe kk-bin çağrısı üstünün fd 9'unu (aynı açık dosya tanımı) devralır; flock aynı tanımda yeniden başarılı.
+# Ortam değişkeni (KK_KILIT_SAHIBI) yalnız log içindir; mirası açmaz. Kilidi tutan süreç ve fd 9'u devralan çocukları
+# bitince (SIGKILL dahil) çekirdek kilidi bırakır: bayat kilit olmaz (dosya kalır, içeriği yalnız "son sahip" bilgisi).
+KK_KILIT=/opt/kara-kutu/work/kk-bin-log/kk-bin.kilit
+kk_kilit() {
+	local kl=${KK_KILIT%/*}/kk-bin.log ad=${0##*/} t
+	t=$(date -u '+%F %T.%3N')
+	mkdir -p "${KK_KILIT%/*}" || exit 77
+	if [ /proc/$$/fd/9 -ef "$KK_KILIT" ] && flock -n 9; then
+		echo "$t UTC [$ad] kilit: miras (sahip ${KK_KILIT_SAHIBI:-?}; pid $$)" >> "$kl"; return 0
+	fi
+	if exec 9>>"$KK_KILIT" && flock -n 9; then
+		export KK_KILIT_SAHIBI="pid=$$ $ad"
+		printf 'pid=%s betik=%s arg=%.80s bas=%s UTC\n' $$ "$ad" "$*" "$t" > "$KK_KILIT"
+		echo "$t UTC [$ad] kilit: alindi (pid $$)" >> "$kl"; return 0
+	fi
+	echo "$t UTC [$ad] RED: kk-bin kilidi mesgul (son sahip: $(head -c 200 "$KK_KILIT" 2>/dev/null | tr -d '\n')); cihaz islemi YAPILMADI; cikis 77" | tee -a "$kl" >&2
+	exit 77
+}
+kk_kilit "$@"
+# --- G49 ortak kilit sonu ---
+T=$(mktemp -d) || exit 70
+trap 'rm -f -- "$T/imaj"; rmdir -- "$T"' EXIT
+cp -- "$IMG" "$T/imaj" || { log "DUR: kopya alinamadi"; exit 70; }
+B=$(stat -c %s "$T/imaj")
+[ "$B" -gt 0 ] && [ "$B" -le $BOLUM_BOY ] || { log "DUR: boyut $B (bolum $BOLUM_BOY)"; exit 65; }
+head -c 8 "$T/imaj" | cmp -s - <(printf 'ANDROID!') || { log "DUR: ANDROID! magic yok"; exit 65; }
+S=$(sha256sum "$T/imaj" | cut -c1-64)
+log "imaj=$IMG boyut=$B sha=$S beklenen=$WANT"
+[ "$S" = "$WANT" ] || { log "DUR: sha tutmuyor"; exit 65; }
+timeout 10 fastboot devices 2>/dev/null | grep -qE "^$SERI[[:space:]]+fastboot" || { log "DUR: $SERI fastboot'ta degil"; exit 1; }
+log "fastboot -s $SERI flash kernel <kopya> (sha $S)"
+timeout 120 fastboot -s $SERI flash kernel "$T/imaj" 2>&1 | tee -a "$LOG"; R=${PIPESTATUS[0]}
+log "flash cikis=$R"
+exit "$R"
