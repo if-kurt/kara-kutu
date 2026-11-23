@@ -1,0 +1,173 @@
+#!/bin/bash
+# Kara Kutu G56 — 4.9 Wi-Fi bekçisi (kk-wifi-bekci.timer, 5 dk'da bir; Type=oneshot). bakımcı onayı 2026-11-21: "Reboot etsin".
+# Ölçüt: KRITER sn (gerçek 1200) KESİNTİSİZ "kötü" = wpa_state COMPLETED değil YA DA wlan0 ağ geçidi ping'i yok.
+# Eylem : flaşsız `systemctl reboot` (normal açılış; kernel bölümüne dokunulmaz).
+# Eylem YOK (yalnız log) eğer:
+#   - çekirdek 4.9 değil (birimde ConditionKernelVersion=4.9.* + burada uname; dosyaya hiçbir şey yazmadan çıkar);
+#   - kapatma dosyası /etc/kk-wifi-bekci.kapali var;
+#   - kk-wifi.service etkin değil ya da /data/kk/state/wifi-fails >= 2 (Wi-Fi bilinçli başlatılmamış);
+#   - uptime < SSH_PENCERE ya da son SSH_PENCERE sn'de (gerçek 1800) ana makine/LAN'dan (172.16.42.2, 192.168.1.x) SSH girişi
+#     (journal "Accepted ... from", monotonic) ya da şu an kurulu SSH bağlantısı var; journal/ss okunamazsa da bekler;
+#   - oran sınırı: 6 saatte >= 1 ya da 24 saatte >= 3 eylem (test kipinde 24 saatte >= 1); saat geri gitmişse (kayıt > şimdi);
+#   - Wi-Fi'nin arada hiç iyi görülmediği ardışık 3 eylem (saatten bağımsız döngü kesici);
+#   - ölçüm yapılamadı (wpa_cli/ip/ping yok: 126/127).
+# "Kesintisiz": /proc/uptime tabanlı (saat adımlarından etkilenmez); durum /run'da (her açılışta sıfır: açılıştan sonraki ilk
+#   KRITER sn ölçüt dolamaz). İki örnek arası > BOSLUK sn ise sayım yeniden başlar.
+# Oran sınırı kayıtları /var/lib/kk-wifi-bekci/ (kalıcı, gerçek saat). Bozuk kayıt = tutucu (bkz. kayit_oku).
+# Test kipi: /etc/kk-wifi-bekci-test.conf (KRITER_SN, SSH_PENCERE_SN, BOSLUK_SN; sınırlar denetlenir; geçersizse gerçek
+#   eşikler) + zamanlayıcı drop-in'i (1 dk). Test kipinde oran sınırı 24 saatte en çok 1 eylem.
+# Yalnız okur: wpa_cli status (salt okuma), ip route, ping (ağ geçidi), journalctl, ss, /data/kk/state/wifi-fails.
+# /sys/hisys/* OKUNMAZ ve YAZILMAZ. Her karar log'a: /var/log/kk-wifi-bekci.log + journal (stdout).
+set -u
+# --- SABITLER (kurulacak betikte ortam değişkeniyle yol/eşik değiştirme kapısı YOK) ---
+PATH=/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+UPTIME_F=/proc/uptime
+RUN_D=/run/kk-wifi-bekci
+LIB_D=/var/lib/kk-wifi-bekci
+LOG_F=/var/log/kk-wifi-bekci.log
+TEST_F=/etc/kk-wifi-bekci-test.conf
+KAPALI_F=/etc/kk-wifi-bekci.kapali
+WIFI_FAILS_F=/data/kk/state/wifi-fails
+# --- SABITLER SONU ---
+KRITER=1200; SSH_PENCERE=1800; BOSLUK=900; SINIR6=1; SINIR24=3; ARDISIK_MAX=3; KIP=gercek
+LOG_MAX=1048576
+
+# 0) Yalnız 4.9: dosyaya hiçbir şey yazmadan çık (ana hat aynı rootfs'i açıyor).
+K=$(uname -r 2>/dev/null)
+case $K in
+	4.9.*) ;;
+	*) echo "kk-wifi-bekci: cekirdek '$K' 4.9 degil: hicbir sey yapilmadi"; exit 0;;
+esac
+
+mkdir -p "$RUN_D" "$LIB_D" 2>/dev/null
+if [ -f "$LOG_F" ] && [ "$(stat -c %s "$LOG_F" 2>/dev/null || echo 0)" -gt $LOG_MAX ]; then mv -f "$LOG_F" "$LOG_F.1"; fi
+log() { local s; s="$(date -u '+%F %T') UTC [$KIP] $*"; echo "kk-wifi-bekci: $*"; echo "$s" >> "$LOG_F"; }
+sayi() { case ${1:-} in ''|*[!0-9]*) return 1;; esac; [ ${#1} -le 12 ]; }
+
+# 1) Test kipi (ayrı dosya). key=deger satırları; yalnız bilinen anahtarlar, sınır denetimli; `source` edilmez.
+if [ -e "$TEST_F" ]; then
+	tk= ts= tb= bozuk=
+	while IFS= read -r l || [ -n "$l" ]; do
+		case $l in ''|'#'*) continue;; esac
+		k=${l%%=*}; v=${l#*=}
+		sayi "$v" || { bozuk=1; break; }
+		case $k in
+			KRITER_SN) tk=$v;; SSH_PENCERE_SN) ts=$v;; BOSLUK_SN) tb=$v;;
+			*) bozuk=1; break;;
+		esac
+	done < "$TEST_F"
+	if [ -z "$bozuk" ] && [ -n "$tk" ] && [ -n "$ts" ] && [ -n "$tb" ] \
+		&& [ "$tk" -ge 120 ] && [ "$tk" -le 1200 ] && [ "$ts" -ge 60 ] && [ "$ts" -le 1800 ] \
+		&& [ "$tb" -ge 120 ] && [ "$tb" -le 900 ]; then
+		KRITER=$tk; SSH_PENCERE=$ts; BOSLUK=$tb; SINIR6=1; SINIR24=1; KIP=test
+	else
+		log "UYARI: $TEST_F gecersiz (anahtar/deger/sinir); GERCEK esikler kullaniliyor"
+	fi
+fi
+
+DURUM_F=$RUN_D/durum   # "kotu_bas son_ornek" (uptime sn)
+yaz() { printf '%s\n' "$2" > "$1.tmp" && mv -f "$1.tmp" "$1"; }
+
+# 2) Kapatma dosyası: sayım sıfırlanır (yeniden açılınca baştan sayar).
+if [ -e "$KAPALI_F" ]; then
+	rm -f "$DURUM_F"; log "KAPALI ($KAPALI_F var): olcum/eylem yok"; exit 0
+fi
+
+up=$(cut -d' ' -f1 "$UPTIME_F" 2>/dev/null); up=${up%%.*}
+sayi "$up" || { log "HATA: uptime okunamadi; eylem yok"; exit 0; }
+
+# 3) /run durumu (bozuksa sıfırla)
+kotu_bas=0; son=0
+if [ -e "$DURUM_F" ]; then
+	read -r a b x < "$DURUM_F" 2>/dev/null
+	if sayi "${a:-}" && sayi "${b:-}" && [ -z "${x:-}" ] && [ "$a" -le "$up" ] && [ "$b" -le "$up" ]; then
+		kotu_bas=$a; son=$b
+	else
+		log "UYARI: $DURUM_F bozuk; sayim sifirlandi"
+	fi
+fi
+if [ "$son" -gt 0 ] && [ $((up - son)) -gt "$BOSLUK" ] && [ "$kotu_bas" -gt 0 ]; then
+	log "ornek boslugu $((up - son)) sn > $BOSLUK: kotu sayimi yeniden basliyor"; kotu_bas=0
+fi
+
+# 4) Ölçüm (hepsi timeout içinde; 126/127 = ölçülemedi)
+olcmedi() { yaz "$DURUM_F" "$kotu_bas $up"; log "OLCULEMEDI: $1; eylem yok"; exit 0; }
+W=$(timeout -k 2 10 wpa_cli -i wlan0 status 2>/dev/null); r=$?
+[ $r -eq 126 ] || [ $r -eq 127 ] && olcmedi "wpa_cli rc=$r"
+st=$(printf '%s\n' "$W" | sed -n 's/^wpa_state=//p' | head -n1)
+R=$(timeout -k 2 5 ip -4 route show default dev wlan0 2>/dev/null); r=$?
+[ $r -eq 126 ] || [ $r -eq 127 ] && olcmedi "ip rc=$r"
+gw=$(printf '%s\n' "$R" | awk '$1=="default" && $2=="via" {print $3; exit}')
+[[ $gw =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || gw=
+pr=-
+if [ "$st" = COMPLETED ] && [ -n "$gw" ]; then
+	timeout -k 2 15 ping -n -q -c 3 -W 2 -I wlan0 "$gw" >/dev/null 2>&1; pr=$?
+	[ $pr -eq 126 ] || [ $pr -eq 127 ] && olcmedi "ping rc=$pr"
+fi
+ozet="wpa=${st:-?} gw=${gw:--} ping_rc=$pr up=$up"
+
+ard_f=$LIB_D/ardisik
+if [ "$st" = COMPLETED ] && [ "$pr" = 0 ]; then
+	[ "$kotu_bas" -gt 0 ] && log "duzeldi: kotu sure $((up - kotu_bas)) sn"
+	yaz "$DURUM_F" "0 $up"
+	if [ -e "$ard_f" ] && [ "$(cat "$ard_f" 2>/dev/null)" != 0 ]; then yaz "$ard_f" 0; sync; log "ardisik eylem sayaci 0'landi (Wi-Fi iyi)"; fi
+	log "karar=IYI $ozet"; exit 0
+fi
+
+# 5) Kötü örnek
+[ "$kotu_bas" -eq 0 ] && kotu_bas=$up
+yaz "$DURUM_F" "$kotu_bas $up"
+sure=$((up - kotu_bas))
+bekle() { log "karar=BEKLE ($1) kotu=${sure}/${KRITER} sn $ozet"; exit 0; }
+[ "$sure" -ge "$KRITER" ] || bekle "olcut dolmadi"
+
+# 6) Eylem önkoşulları
+systemctl is-active --quiet kk-wifi.service 2>/dev/null || bekle "kk-wifi.service etkin degil"
+wf=$(cat "$WIFI_FAILS_F" 2>/dev/null)
+sayi "$wf" || bekle "wifi-fails okunamadi"
+[ "$wf" -lt 2 ] || bekle "wifi-fails=$wf (Wi-Fi bilincli baslatilmadi)"
+[ "$up" -ge "$SSH_PENCERE" ] || bekle "uptime < SSH penceresi $SSH_PENCERE sn"
+J=$(timeout -k 2 20 journalctl -b 0 -t sshd -t sshd-session -o short-monotonic -n 5000 -q --no-pager 2>/dev/null); r=$?
+[ $r -eq 0 ] || bekle "journalctl okunamadi (rc=$r)"
+sts=$(printf '%s\n' "$J" | grep -E 'Accepted [a-z/-]+ for [^ ]+ from (172\.16\.42\.2|192\.168\.1\.[0-9]{1,3}) ' | tail -n1 | sed -n 's/^\[ *\([0-9]*\)\..*/\1/p')
+if [ -n "$sts" ]; then
+	sayi "$sts" || bekle "SSH zaman damgasi okunamadi"
+	[ $((up - sts)) -ge "$SSH_PENCERE" ] || bekle "ana makine/LAN SSH girisi $((up - sts)) sn once (< $SSH_PENCERE)"
+fi
+S=$(timeout -k 2 5 ss -Htn state established '( sport = :22 )' 2>/dev/null); r=$?
+[ $r -eq 0 ] || bekle "ss okunamadi (rc=$r)"
+printf '%s\n' "$S" | grep -qE '(172\.16\.42\.2|192\.168\.1\.[0-9]{1,3})\]?:[0-9]+[[:space:]]*$' && bekle "kurulu SSH baglantisi var"
+
+# 7) Oran sınırı (kalıcı; gerçek saat). eylemler: "epoch uptime kip" satırları.
+ey_f=$LIB_D/eylemler
+now=$(date +%s)
+sayi "$now" || bekle "saat okunamadi"
+if [ -e "$ey_f" ]; then
+	if grep -qvE '^[0-9]{1,12} [0-9]{1,12} (gercek|test)$' "$ey_f" 2>/dev/null; then
+		mv -f "$ey_f" "$ey_f.bozuk.$up"; printf '%s %s %s\n' "$now" "$up" "$KIP" > "$ey_f"; sync
+		bekle "eylem kaydi bozuktu ($ey_f.bozuk.$up); tutucu: simdi eylem yapilmis sayildi"
+	fi
+fi
+n6=0; n24=0; ileri=0
+if [ -e "$ey_f" ]; then
+	while read -r e _ _; do
+		[ "$e" -gt $((now + 60)) ] && ileri=1
+		[ $((now - e)) -lt 21600 ] && n6=$((n6 + 1))
+		[ $((now - e)) -lt 86400 ] && n24=$((n24 + 1))
+	done < "$ey_f"
+fi
+[ "$ileri" = 0 ] || bekle "SINIR: saat geri gitmis (kayit > simdi); eylem yok"
+[ "$n6" -lt "$SINIR6" ] || bekle "SINIR: 6 saatte $n6 eylem (en cok $SINIR6)"
+[ "$n24" -lt "$SINIR24" ] || bekle "SINIR: 24 saatte $n24 eylem (en cok $SINIR24)"
+ard=0
+if [ -e "$ard_f" ]; then ard=$(cat "$ard_f" 2>/dev/null); sayi "$ard" || ard=$ARDISIK_MAX; fi
+[ "$ard" -lt "$ARDISIK_MAX" ] || bekle "SINIR: arada Wi-Fi iyi gorulmeden $ard ardisik eylem (en cok $ARDISIK_MAX)"
+
+# 8) EYLEM: önce kayıt diske, sonra flaşsız reboot.
+printf '%s %s %s\n' "$now" "$up" "$KIP" >> "$ey_f"
+yaz "$ard_f" $((ard + 1))
+log "EYLEM: systemctl reboot (flassiz) kotu=${sure} sn >= ${KRITER}; 6s=$n6 24s=$n24 ardisik=$((ard + 1)); $ozet"
+sync; timeout -k 2 10 journalctl --sync >/dev/null 2>&1; sync
+timeout -k 2 30 systemctl --no-block reboot; r=$?
+[ $r -eq 0 ] || log "HATA: systemctl reboot rc=$r"
+exit 0

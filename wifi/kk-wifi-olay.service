@@ -1,0 +1,15 @@
+[Unit]
+Description=Kara Kutu Wi-Fi olay betigi (wpa_cli -a): her CONNECTED'da guc tasarrufunu kapat (G35)
+After=wpa_supplicant@wlan0.service
+BindsTo=wpa_supplicant@wlan0.service
+
+[Service]
+Type=simple
+# wpa_supplicant@wlan0 --no-block başlatılıyor; kontrol soketi gelene kadar en çok 30 sn bekle (ilk açılışta exit-code olmasın)
+ExecStartPre=/bin/sh -c 'i=0; while [ $i -lt 60 ]; do [ -S /run/wpa_supplicant/wlan0 ] && exit 0; sleep 0.5; i=$((i + 1)); done; exit 1'
+ExecStart=/sbin/wpa_cli -i wlan0 -a /usr/local/sbin/kk-wifi-olay
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=wpa_supplicant@wlan0.service

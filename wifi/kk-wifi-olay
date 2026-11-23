@@ -1,0 +1,31 @@
+#!/bin/sh
+# Kara Kutu G35 — Wi-Fi olay betiği (wpa_cli -a; kk-wifi-olay.service).
+#   kk-wifi-olay <arayüz> <olay>
+# Her CONNECTED'da Hi1102 802.11 güç tasarrufunu (B katmanı, CMD biti) çalışma anında yeniden kapatır:
+#   echo "wlan0 set_sta_pm_on 0" > /sys/hisys/hipriv
+# Host/çip uykusu (A katmanı) açılmışsa (g_wlan_pm_switch:1) onu da kapatır:
+#   echo "Hisilicon0 pm_switch 0" > /sys/hisys/hipriv
+# B katmanı her yeni association'da sıfırlanır (G34 araştırması); A katmanı wlan0 down/up, DFR, reboot ile 1'e döner.
+# /sys/hisys/pmdbg/wifi_pm YALNIZ OKUNUR (asla yazılmaz). NV/ini/firmware yazmaz. Başarısızlık yalnız loglanır.
+H=/sys/hisys/hipriv
+P=/sys/hisys/pmdbg/wifi_pm
+log() { echo "kk-wifi-olay: $*"; echo "<5>kk: wifi-olay: $*" 2>/dev/null > /dev/kmsg; }
+[ "$1" = wlan0 ] || exit 0
+case "$2" in
+CONNECTED)
+	r1=- r2=-
+	if [ -w "$H" ]; then
+		echo "wlan0 set_sta_pm_on 0" > "$H"; r1=$?
+		if grep -q 'g_wlan_pm_switch:1' "$P" 2>/dev/null; then
+			sleep 1
+			echo "Hisilicon0 pm_switch 0" > "$H"; r2=$?
+		fi
+	fi
+	sleep 1
+	log "CONNECTED: set_sta_pm_on 0 rc=$r1, pm_switch 0 rc=$r2 (- = gerek yoktu/yapilamadi); $(grep -E '^power on|^dev state' "$P" 2>/dev/null | tr '\n' ' ')"
+	;;
+DISCONNECTED)
+	log "DISCONNECTED"
+	;;
+esac
+exit 0

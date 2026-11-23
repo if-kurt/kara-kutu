@@ -1,0 +1,12 @@
+[Unit]
+Description=Kara Kutu 4.9 Wi-Fi bekcisi zamanlayicisi (G56, 5 dk)
+# Yalniz 4.9 (ana hatta zamanlayici hic baslamaz).
+ConditionKernelVersion=4.9.*
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Kara Kutu 4.9 Wi-Fi bekcisi (G56): 20 dk kesintisiz baglantisizlikta flassiz reboot (oran sinirli)
+Documentation=file:/usr/local/sbin/kk-wifi-bekci
+# Yalniz 4.9 (ana hat ayni rootfs'i aciyor; orada calismamali). Betik ayrica uname'e bakar.
+ConditionKernelVersion=4.9.*
+After=kk-wifi.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/kk-wifi-bekci
+TimeoutStartSec=120
