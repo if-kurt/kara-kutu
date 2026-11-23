@@ -1,0 +1,48 @@
+# Reference: https://wiki.postmarketos.org/wiki/Deviceinfo_reference
+# Huawei P30 Lite (Kirin 710, MAR-LX1A) running a mainline-based kernel.
+# Local recipe, not for the official pmaports tree.
+
+deviceinfo_format_version="0"
+deviceinfo_name="Huawei P30 Lite"
+deviceinfo_manufacturer="Huawei"
+deviceinfo_codename="huawei-marie"
+deviceinfo_year="2019"
+deviceinfo_arch="aarch64"
+
+# Device
+deviceinfo_chassis="embedded"
+deviceinfo_keyboard="false"
+deviceinfo_external_storage="true"
+deviceinfo_screen_width="1080"
+deviceinfo_screen_height="2312"
+deviceinfo_dtb="hisilicon/kirin710-huawei-marie-birlesik"
+
+# Boot image. The stock bootloader only reads the "kernel" partition: it loads
+# the payload at 0x80000, uses its own device tree and does NOT load the ramdisk.
+# The values below describe the stock header that tools/clone-boot-header.py copies.
+deviceinfo_flash_method="fastboot"
+deviceinfo_flash_pagesize="2048"
+deviceinfo_flash_offset_base="0x00000000"
+deviceinfo_flash_offset_kernel="0x00080000"
+deviceinfo_flash_offset_ramdisk="0x07c00000"
+deviceinfo_flash_offset_second="0x00f00000"
+deviceinfo_flash_offset_tags="0x07a00000"
+deviceinfo_header_version="1"
+deviceinfo_flash_fastboot_partition_kernel="kernel"
+deviceinfo_append_dtb="false"
+# The generic boot.img from boot-deploy is NOT usable as is (no shim, header
+# differs from stock). Use tools/pack-kernel-partition.sh on the built Image.
+deviceinfo_generate_bootimg="false"
+
+# The shipped kernel config has RD_GZIP off and RD_ZSTD on (default is gzip).
+deviceinfo_initfs_compression="zstd:default"
+
+# Kernel command line comes from kernel-cmdline.conf, but the bootloader does
+# not pass it on: it must be written into the DTB (/chosen/bootargs).
+
+# USB gadget (NCM only; the kernel has no RNDIS function)
+deviceinfo_usb_network_function="ncm.usb0"
+deviceinfo_usb_network_udc=""
+
+# Hi1102 Wi-Fi firmware is NOT packaged. Take cr4_asic.bin, CPU_RAM_SCHED.bin and
+# CPU_RAM_WBS.bin from your own device (vendor/firmware) and see README.

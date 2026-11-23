@@ -1,0 +1,77 @@
+# Local recipe, not for the official pmaports tree.
+# Kernel config based on the config of the daily mainline image of this project
+# (see ../KNOWN-GAPS.md for what differs from pmaports kconfig requirements).
+_flavor="huawei-marie"
+pkgname=linux-$_flavor
+pkgver=6.12.117
+pkgrel=0
+pkgdesc="Mainline based kernel for the Huawei P30 Lite (Kirin 710)"
+arch="aarch64"
+_carch="arm64"
+url="https://github.com/if-kurt/linux-kirin710"
+license="GPL-2.0-only"
+options="
+	!check
+	!strip
+	!tracedeps
+	pmb:cross-native
+"
+makedepends="
+	bash
+	bc
+	bison
+	elfutils-dev
+	findutils
+	flex
+	gzip
+	linux-headers
+	openssl-dev
+	perl
+	postmarketos-installkernel
+	python3
+"
+
+# PLACEHOLDER: replace with the commit (or tag) of the fork to build, then run
+# "pmbootstrap checksum linux-huawei-marie" to refresh sha512sums.
+_commit="0000000000000000000000000000000000000000"
+
+source="
+	linux-kirin710-$_commit.tar.gz::$url/archive/$_commit.tar.gz
+	config-$_flavor.$arch
+	shim.S
+"
+builddir="$srcdir/linux-kirin710-$_commit"
+
+prepare() {
+	default_prepare
+	cp "$srcdir/config-$_flavor.$arch" .config
+	make ARCH="$_carch" olddefconfig
+}
+
+build() {
+	unset LDFLAGS
+	make ARCH="$_carch" \
+		KBUILD_BUILD_VERSION="$((pkgrel + 1))-$_flavor" \
+		Image.gz dtbs
+}
+
+package() {
+	mkdir -p "$pkgdir"/boot
+
+	# CONFIG_MODULES is not set in this config: no modules_install.
+	make ARCH="$_carch" dtbs_install zinstall \
+		INSTALL_PATH="$pkgdir"/boot \
+		INSTALL_DTBS_PATH="$pkgdir"/boot/dtbs
+
+	install -D "$builddir"/include/config/kernel.release \
+		"$pkgdir"/usr/share/kernel/"$_flavor"/kernel.release
+
+	# Helper for the kernel partition image (shim + DTB + Image), see README.
+	install -Dm644 "$srcdir"/shim.S "$pkgdir"/usr/share/linux-$_flavor/shim.S
+}
+
+sha512sums="
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000  linux-kirin710-0000000000000000000000000000000000000000.tar.gz
+445322654738f1ec362040e1cf7a94b4aea9a50d0d03c410cf6a2997e4f727256b6b01298443f344d35e8cf0e137c049115fe03f9af7c873db0efd9ccc9841eb  config-huawei-marie.aarch64
+6762c27a4f05f26b28be71d963ef85f65085505973f917707aa291da787b30eb3ced92283a35c48f6456ca6a27dc8a5ac726ab08fac28b2c3a6bea2f02adb283  shim.S
+"

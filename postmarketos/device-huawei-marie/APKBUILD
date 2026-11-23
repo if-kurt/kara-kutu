@@ -1,0 +1,35 @@
+# Reference: <https://postmarketos.org/devicepkg>
+# Local recipe, not for the official pmaports tree.
+pkgname=device-huawei-marie
+pkgver=1
+pkgrel=0
+pkgdesc="Huawei P30 Lite (Kirin 710)"
+url="https://github.com/if-kurt/linux-kirin710"
+arch="aarch64"
+license="MIT"
+depends="
+	linux-huawei-marie
+	postmarketos-base
+"
+makedepends="devicepkg-dev"
+source="
+	deviceinfo
+	kernel-cmdline.conf
+"
+options="!check !archcheck"
+
+# No firmware subpackage on purpose: the Hi1102 Wi-Fi firmware is not
+# redistributable. See ../README.md for where to take it from.
+
+build() {
+	devicepkg_build $startdir $pkgname
+}
+
+package() {
+	devicepkg_package $startdir $pkgname
+}
+
+sha512sums="
+eccea41e408554cd248ee741f5b412c1c9f03b25851a245cc7555916fc69e4843740db73db503bf848a55e215ce8a116d9b1ef7528fa46bd3be3f1e659ce650a  deviceinfo
+d80567bb193151e7b0122a5711a02babb9aa3c6596767f53fd1c59f56a0dd0608d0633f076b5df6d548ad4aabf2b6194fb6bfe174b93dff58ce78a1d90016d28  kernel-cmdline.conf
+"

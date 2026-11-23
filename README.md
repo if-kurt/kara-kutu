@@ -39,7 +39,7 @@ Working research project, not an installer.
 | `tools/qemu/` | QEMU VM slot helper used for regression runs |
 | `initramfs/` | Early-boot scripts embedded in the kernel image: `init`, write gate (`kk-alan`), health watchdog (`kk-saglik`), idle watchdog, zram setup, Wi-Fi firmware loader and watchdog, rescue shell helper |
 | `wifi/` | Wi-Fi watchdog and event helpers for the 4.9 Debian side |
-| `postmarketos/` | *Planned:* postmarketOS recipe for this device (not published yet) |
+| `postmarketos/` | Local postmarketOS recipe (`device-huawei-marie`, `linux-huawei-marie`) for use with your own pmaports checkout; not bootable yet, see `postmarketos/KNOWN-GAPS.md` |
 
 Documentation is in Turkish; the safety summary below and the header of `docs/guvenlik-tasarimi.md` are in English.
 
