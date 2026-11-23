@@ -1,0 +1,26 @@
+# Cihaza ve kuruluma ozgu, depoya girmeyecekler
+known_hosts
+known_hosts_*
+*.img
+*.bin
+*.fw
+*.log
+*.pstore
+*.tar
+*.tar.gz
+*.xz
+*.zip
+*.bak
+*.oncesi
+SHA256SUMS.yerel
+backup/
+backups/
+yedek/
+dump/
+dumps/
+work/
+refs/
+.env
+*.key
+*.pem
+id_*
