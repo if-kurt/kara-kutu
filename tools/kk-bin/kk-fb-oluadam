@@ -2,6 +2,7 @@
 # Kara Kutu kk-bin (G56; G58 izleme ayrımı): fastboot ölü adam dönüşü. kullanıcı crontab'ından 5 dk'da bir; argümansız. bakımcı onayı 2026-11-21: "Evet, kur".
 # Kural: cihaz (<CIHAZ_SERI>) ESIK sn (1200) KESİNTİSİZ fastboot'ta VE son ESIK sn'de İZLEME DIŞI hiçbir kk-bin çağrısı yoksa
 #   -> kk-v51-don (bir kez). Çıktısı kk-bin.log'a (kk-v51-don'un kendi log'u) ve bu betiğin log'una.
+# G64 (tasarım + bakımcı onayı 2026-11-24): kk-v51-don artık v5.1 yerine v5.2'yi (eMMC yazma kapılı 4.9, 7551ffa6…) yazar; ad aynı.
 # G58 (tasarım): IZLEME araçları (salt okuma: kk-anahat-saglik, kk-anahat-olcum, kk-anahat-pstore-al) sessizliği BOZMAZ.
 #   kk-anahat-ssh izleme DEĞİLDİR (reboot da gönderir). Sessizlik = en yeni şu ikisi:
 #   (i) kk-bin.log'un son 1 MiB'ı (ilk, kesik olabilecek satır atlanır): [ad] etiketi IZLEME'de olmayan zaman damgalı satırların
@@ -165,6 +166,6 @@ log "EYLEM: fastboot'ta ${sure} sn, son izleme disi kk-bin ${yas} sn once ($kay)
 echo "$(date -u '+%F %T.%3N') UTC [kk-fb-oluadam] EYLEM: ${sure} sn fastboot, ${yas} sn izleme disi kk-bin yok -> kk-v51-don (cron, tek deneme)" >> "$KKLOG"
 export KK_KILIT_SAHIBI="pid=$$ kk-fb-oluadam"
 "$V51" >> "$OLOG" 2>&1 8>&-; r=$?
-log "kk-v51-don cikis=$r (0 v5.1 dogrulandi; 1 flash yok; 2 Debian gelmedi; 3 sha tutmadi; 77 kilit)"
+log "kk-v51-don cikis=$r (0 bilinen iyi 4.9 = v5.2 dogrulandi (G64); 1 flash yok; 2 Debian gelmedi; 3 sha/kapi tutmadi; 77 kilit)"
 echo "$(date -u '+%F %T.%3N') UTC [kk-fb-oluadam] kk-v51-don cikis=$r" >> "$KKLOG"
 exit 0

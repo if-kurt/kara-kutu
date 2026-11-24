@@ -1,0 +1,97 @@
+#!/bin/bash
+# Kara Kutu kk-bin ÖNERİSİ (G60-6, E7 cihaz denemesi; ONAY BEKLİYOR, kk-bin'e KONMADI): 4.9 Debian'da (v5.1, SSH 22) kkdata (p68 = /data)
+# içinde ana hat E7 kök ağacı hazırlığı. Desen: kk-49-alan (öz sha, ortak kilit, systemd-run birimi, sleep + üst süre) + kk-anahat-saglik
+# (özel kopyada cihaz betiği sha denetimi). Cihaz betiği: cihaz/49-kok.sh (sha SABİT, aşağıda SSHA).
+#   kk-49-kok denetle <cikti>         YALNIZ OKUMA: uname, /data = kkdata ext4, boş alan, os/debian + os/debian-anahat, dumpe2fs -h,
+#                                     debian-anahat/var/lib/kk-kok/{kirli,acik,kapandi,saat}
+#   kk-49-kok kopya <cikti>           os/debian -> os/debian-anahat (YALNIZ hedefe yazar; hedef varsa DUR; boş alan >= 1,3 x boyut;
+#                                     sonra dosya sayısı + bayt denetimi). Uzun: birim RuntimeMaxSec=1800, bekleme 190 x 10 sn.
+#                                     ana makinede arka planda (run_in_background) çalıştırılır; tamamlanma bildirimle beklenir.
+#   kk-49-kok kirli-sifirla <cikti>   debian-anahat/var/lib/kk-kok/kirli <- 0 (hedef ağaç yoksa DUR)
+# Hedef SABİT: ${KK_KULLANICI:-kk}@172.16.42.1 port 22, known_hosts; uname ^4\.9\. aynı ana bağlantıda (ControlMaster). Cihaza yalnız bu
+# cihaz betiği (stdin -> sudo tee /run/kk-49-kok.sh -> sh -n + sha256 uzak = yerel) gider; birim: kk-49-kok.service (--collect).
+# Çıktı <cikti> (work/ altında, yoksa açılır): cihaz günlüğü /run/kk-49-kok.log. Özel satırlar stderr'e (≤ 30 satır).
+# Çıkış: 0 tamam / 3 dur (ölçüt tutmadı ya da bitmedi) / 1 bağlantı yok / 64 girdi / 65 doğrulama (öz sha, uname, cihaz betiği sha,
+#        önceki birim) / 77 kilit dolu. Log: work/kk-bin-log/kk-bin.log. Kurmak/değiştirmek bakımcı onayı (docs/guvenlik-tasarimi.md kural 12).
+# Ölü adam: bu araç kk-fb-oluadam / kk-kurtarma-oto IZLEME listesinde DEĞİL (izleme dışı; kk-bin çağrısı sayılır; fastboot'ta kullanılmaz).
+# Ortak kk-bin kilidi (flock -n, work/kk-bin-log/kk-bin.kilit, fd 9); doluysa çıkış 77, cihaz işlemi yapılmaz.
+set -u
+KB=/opt/kara-kutu/tools/kk-bin; ME=$(realpath -- "$0")
+S=$KB/cihaz/49-kok.sh
+SSHA=5e913193c212d6fa2046e2d2978a7a7f0e1ec4e09b8f93d065d420fb49f27137
+H=172.16.42.1; P=22; U=${KK_KULLANICI:-kk}
+UNAME_RE='^4\.9\.'
+LOG=/opt/kara-kutu/work/kk-bin-log/kk-bin.log; mkdir -p "${LOG%/*}"
+log() { echo "$(date -u '+%F %T.%3N') UTC [kk-49-kok] $*" | tee -a "$LOG" >&2; }
+[ "$P" = 22 ] || exit 70
+KUL="kullanim: kk-49-kok denetle|kopya|kirli-sifirla <cikti-dosyasi>"
+[ $# -eq 2 ] || { echo "$KUL" >&2; exit 64; }
+MOD=$1; case $MOD in denetle|kopya|kirli-sifirla) ;; *) echo "$KUL" >&2; exit 64;; esac
+OUT=$(realpath -m -- "$2")
+case $OUT in /opt/kara-kutu/work/?*) ;; *) log "DUR: cikti work/ disinda: $OUT"; exit 64;; esac
+[ -e "$OUT" ] && { log "DUR: cikti zaten var: $OUT"; exit 64; }
+[ -d "${OUT%/*}" ] || { log "DUR: dizin yok: ${OUT%/*}"; exit 64; }
+want=$(awk '$2=="kk-49-kok"{print $1}' "$KB/SHA256SUMS"); have=$(sha256sum "$ME" | cut -c1-64)
+[ -n "$want" ] && [ "$want" = "$have" ] || { log "DUR: betik sha256 SHA256SUMS ile tutmadi ($have)"; exit 65; }
+# mod başına birim süresi ve bekleme (adım x sn): bekleme süresi birim süresinden uzun (birim bitmeden çıktı alınmaz)
+case $MOD in
+	kopya) RT=1800; N=190; AR=10;;
+	*) RT=300; N=65; AR=5;;
+esac
+# --- G49 ortak kilit (kural 17'nin mekanik karşılığı): cihaza dokunan kk-bin çağrıları tek tek. ---
+# flock, work/kk-bin-log/kk-bin.kilit üzerinde, fd 9. Bekleme YOK (-n): kilit doluysa hemen 77, cihaz işlemi yapılmaz.
+# Miras: iç içe kk-bin çağrısı üstünün fd 9'unu (aynı açık dosya tanımı) devralır; flock aynı tanımda yeniden başarılı.
+# Ortam değişkeni (KK_KILIT_SAHIBI) yalnız log içindir; mirası açmaz. Kilidi tutan süreç ve fd 9'u devralan çocukları
+# bitince (SIGKILL dahil) çekirdek kilidi bırakır: bayat kilit olmaz (dosya kalır, içeriği yalnız "son sahip" bilgisi).
+KK_KILIT=/opt/kara-kutu/work/kk-bin-log/kk-bin.kilit
+kk_kilit() {
+	local kl=${KK_KILIT%/*}/kk-bin.log ad=${0##*/} t
+	t=$(date -u '+%F %T.%3N')
+	mkdir -p "${KK_KILIT%/*}" || exit 77
+	if [ /proc/$$/fd/9 -ef "$KK_KILIT" ] && flock -n 9; then
+		echo "$t UTC [$ad] kilit: miras (sahip ${KK_KILIT_SAHIBI:-?}; pid $$)" >> "$kl"; return 0
+	fi
+	if exec 9>>"$KK_KILIT" && flock -n 9; then
+		export KK_KILIT_SAHIBI="pid=$$ $ad"
+		printf 'pid=%s betik=%s arg=%.80s bas=%s UTC\n' $$ "$ad" "$*" "$t" > "$KK_KILIT"
+		echo "$t UTC [$ad] kilit: alindi (pid $$)" >> "$kl"; return 0
+	fi
+	echo "$t UTC [$ad] RED: kk-bin kilidi mesgul (son sahip: $(head -c 200 "$KK_KILIT" 2>/dev/null | tr -d '\n')); cihaz islemi YAPILMADI; cikis 77" | tee -a "$kl" >&2
+	exit 77
+}
+kk_kilit "$@"
+# --- G49 ortak kilit sonu ---
+
+T=$(mktemp -d) || exit 70
+O=(-p "$P" -o UserKnownHostsFile="$KB/known_hosts" -o StrictHostKeyChecking=yes -o BatchMode=yes
+   -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 -S "$T/s")
+bitir() { [ -S "$T/s" ] && ssh "${O[@]}" -O exit "$U@$H" >/dev/null 2>&1 </dev/null; rm -f -- "$T/s" "$T/b"; rmdir -- "$T" 2>/dev/null; }
+trap bitir EXIT
+r() { timeout 60 ssh "${O[@]}" "$U@$H" "$1" </dev/null; }
+# cihaz betiği özel kopyada denetlenir; gönderilen o kopyadır
+cp -- "$S" "$T/b" 2>/dev/null && [ "$(sha256sum "$T/b" | cut -c1-64)" = "$SSHA" ] || { log "DUR: cihaz betigi $S sha'si beklenen degil; gonderilmedi"; exit 65; }
+# ana bağlantı (fd 9 kapalı: ana süreç kilidi tutmaz) + uname aynı bağlantıda
+timeout 20 ssh "${O[@]}" -M -fN "$U@$H" 9>&- 2>/dev/null </dev/null || { log "DUR: $H:$P baglanti yok"; exit 1; }
+un=$(r 'uname -r' 2>/dev/null | tr -d '\r')
+[[ $un =~ $UNAME_RE ]] || { log "DUR: uname tutmadi ($H:$P uname='${un:0:60}'); hicbir sey yapilmadi"; exit 65; }
+onceki=$(r 'systemctl is-active kk-49-kok.service' 2>/dev/null | tr -d '\r\n')
+[ "$onceki" = inactive ] || { log "DUR: onceki birim durumu: '$onceki'"; exit 65; }
+uz=$(timeout 30 ssh "${O[@]}" "$U@$H" 'sudo -n tee /run/kk-49-kok.sh >/dev/null && sudo -n sh -n /run/kk-49-kok.sh && sha256sum /run/kk-49-kok.sh' < "$T/b" 2>&1 | cut -c1-64)
+[ "$uz" = "$SSHA" ] || { log "DUR: cihaz betigi sha tutmadi (yerel $SSHA, uzak '${uz:0:64}')"; exit 65; }
+log "uname OK $un; cihaz betigi /run/kk-49-kok.sh sha $SSHA; mod=$MOD -> $OUT"
+r "sudo -n systemd-run --unit=kk-49-kok --collect -p RuntimeMaxSec=$RT /bin/sh /run/kk-49-kok.sh $MOD" >/dev/null 2>&1 \
+	|| { log "DUR: systemd-run basarisiz"; exit 3; }
+
+# Bekleme: sleep + kesin üst süre (N x AR sn; kural 16); durum birim adıyla sorulur (öz eşleşme yok).
+st=active; i=0
+while [ $i -lt $N ]; do
+	sleep $AR; i=$((i+1))
+	st=$(r 'systemctl is-active kk-49-kok.service' 2>/dev/null | tr -d '\r'); st=${st:-baglanti-yok}
+	case $st in active|activating|baglanti-yok) ;; *) break;; esac
+done
+log "birim: $st ($((i * AR)) sn)"
+r 'cat /run/kk-49-kok.log' > "$OUT" 2>&1
+grep -E 'DUR|SONUC|TAMAM|UYARI|^uname|^var:|^yok:|^dosya |^kirli|^acik|^kapandi|^saat|State|needs_recovery|Journal' "$OUT" | cut -c1-240 | head -n 30 >&2
+case $st in active|activating|baglanti-yok) log "UYARI: mod=$MOD birim bitmedi (durum $st; $((i * AR)) sn); cikti $OUT"; exit 3;; esac
+if grep -q ' SONUC tamam' "$OUT"; then log "TAMAM: mod=$MOD; $(grep -m1 ' SONUC tamam' "$OUT" | cut -c1-200)"; exit 0; fi
+log "UYARI: mod=$MOD tamamlanmadi (birim $st); cikti $OUT"; exit 3

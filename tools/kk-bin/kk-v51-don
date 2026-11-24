@@ -1,16 +1,18 @@
 #!/bin/bash
-# Kara Kutu kk-bin: cihaz fastboot'tayken v5.1'e dön. Girdi ALMAZ; imaj ve sha sabit.
-#   1. imaj work/test2/kk-rescue-kernel-v5.1.img, boyut tam 25 165 824 B, sha d27b3d73… (kk-flash-kernel de yeniden denetler);
+# Kara Kutu kk-bin: cihaz fastboot'tayken bilinen iyi 4.9'a dön. Girdi ALMAZ; imaj ve sha sabit.
+# G64 (tasarım + bakımcı onayı 2026-11-24): v5.2 cihazda doğrulandıktan sonra v5.1 yerine v5.2 (eMMC yazma kapılı) yazılır; ad aynı
+#   kaldı (kk-fb-oluadam bu adı çağırır). v5.1 dosyası saklanır: work/test2/kk-rescue-kernel-v5.1.img d27b3d736ed1110586f948f1c27bc6b21a5ac45ae8ef5894c29e9bba6d65b449.
+#   1. imaj work/g63/v52/kk-v52-kernel.img, boyut tam 25 165 824 B, sha 7551ffa6… (kk-flash-kernel de yeniden denetler);
 #   2. kk-flash-kernel (yalnız kernel bölümü);
 #   3. kk-reboot fastboot-normal 22 (240 sn Debian SSH);
-#   4. Debian'da kernel bölümünün sha'sı (PARTNAME=kernel, salt okuma) = d27b3d73… doğrulanır.
-# Çıkış 0 = v5.1 doğrulandı; 1 flash yapılamadı; 2 Debian gelmedi; 3 kernel sha tutmadı; 64 girdi.
+#   4. Debian'da kernel bölümünün sha'sı (PARTNAME=kernel, salt okuma) = 7551ffa6… ve eMMC kapısı ACIK profil 1 doğrulanır.
+# Çıkış 0 = v5.2 doğrulandı; 1 flash yapılamadı; 2 Debian gelmedi; 3 kernel sha tutmadı; 64 girdi.
 # Değiştirmek bakımcının onayını gerektirir.
 # G50 (bakımcı onayı (i), G49 önerisi): ortak kk-bin kilidi (flock -n, work/kk-bin-log/kk-bin.kilit, fd 9); doluysa çıkış 77, hiçbir şey yapılmaz.
 set -u
 KB=/opt/kara-kutu/tools/kk-bin
-IMG=/opt/kara-kutu/work/test2/kk-rescue-kernel-v5.1.img
-WANT=d27b3d736ed1110586f948f1c27bc6b21a5ac45ae8ef5894c29e9bba6d65b449
+IMG=/opt/kara-kutu/work/g63/v52/kk-v52-kernel.img
+WANT=7551ffa6df901d255926d0c1bd3e4cced0a98265684d2e68ddada6ff13f2e05c
 LOG=/opt/kara-kutu/work/kk-bin-log/kk-bin.log; mkdir -p "${LOG%/*}"
 log() { echo "$(date -u '+%F %T.%3N') UTC [kk-v51-don] $*" | tee -a "$LOG"; }
 SSH=(ssh -o UserKnownHostsFile=$KB/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=10 ${KK_KULLANICI:-kk}@172.16.42.1)
@@ -38,9 +40,9 @@ kk_kilit() {
 }
 kk_kilit "$@"
 # --- G49 ortak kilit sonu ---
-[ "$(stat -c %s "$IMG" 2>/dev/null)" = 25165824 ] || { log "DUR: v5.1 imaj boyutu"; exit 1; }
-[ "$(sha256sum "$IMG" | cut -c1-64)" = $WANT ] || { log "DUR: v5.1 imaj sha'si d27b3d73… degil"; exit 1; }
-log "v5.1'e donus basliyor"
+[ "$(stat -c %s "$IMG" 2>/dev/null)" = 25165824 ] || { log "DUR: v5.2 imaj boyutu"; exit 1; }
+[ "$(sha256sum "$IMG" | cut -c1-64)" = $WANT ] || { log "DUR: v5.2 imaj sha'si 7551ffa6… degil"; exit 1; }
+log "bilinen iyi 4.9'a donus basliyor (v5.2, 7551ffa6…)"
 "$KB/kk-flash-kernel" "$IMG" $WANT || { log "DUR: flash basarisiz"; exit 1; }
 "$KB/kk-reboot" fastboot-normal 22; R=$?
 [ $R -eq 2 ] || { log "UYARI: Debian SSH gelmedi (izle=$R)"; exit 2; }
@@ -54,5 +56,8 @@ EOF
 	timeout 5 tail -f /dev/null 9>&-  # G53: timeout kendi surec grubunda; kilit fd 9'u devralmasin (grup SIGKILL'inde <= 5 sn bayat kilit)
 done
 log "Debian kernel bolumu sha=$K"
-[ "$K" = $WANT ] || { log "UYARI: kernel bolumu v5.1 DEGIL"; exit 3; }
-log "v5.1 DOGRULANDI (Debian acik, kernel = d27b3d73…)"
+[ "$K" = $WANT ] || { log "UYARI: kernel bolumu v5.2 DEGIL"; exit 3; }
+D=$("${SSH[@]}" 'cat /sys/kernel/kk_emmc_kapi/durum /sys/kernel/kk_emmc_kapi/profil' 2>/dev/null </dev/null | tr '\n' ' ')
+log "kapi: $D"
+case "$D" in "ACIK 1 "*) ;; *) log "UYARI: kapi ACIK/profil 1 degil ($D)"; exit 3;; esac
+log "v5.2 DOGRULANDI (Debian acik, kernel = 7551ffa6…, kapi ACIK profil 1)"

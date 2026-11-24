@@ -2,6 +2,8 @@
 # Kara Kutu kk-bin: yazılımla yeniden başlatma (tuş yok) ve ardından izleme.
 #   kk-reboot debian-bootloader          Debian'dan `systemctl reboot bootloader`; önce USB 60 sn kararlılık; 90 sn fastboot bekler
 #   kk-reboot debian-normal              Debian'dan `systemctl reboot`; 240 sn SSH bekler
+#   kk-reboot debian-erecovery           (G64) 4.9 Debian'dan (SSH 22, uname 4.9) `systemctl reboot erecovery` (0x08, eRecovery yuvası);
+#                                        önce USB 60 sn kararlılık; 22 kapanınca 240 sn telnet 23 bekler (yuvayı kk-kurtarma durum doğrular)
 #   kk-reboot fastboot-normal [herhangi|22]
 #                                        `fastboot -s <CIHAZ_SERI> reboot` (T0 log'a); herhangi = 300 sn (test),
 #                                        22 = 240 sn Debian SSH (dönüş). Varsayılan herhangi.
@@ -25,9 +27,9 @@ SSH=(ssh -o UserKnownHostsFile=$KB/known_hosts -o StrictHostKeyChecking=yes -o B
 ANAHAT_G2=1  # G57 G-8 kapısı; G58 O-G8-4 onaylı (G-2: mode-normal 0x10, mode-erecovery 0x08). İkinci kapı (cihazın DT satırı) aynen.
 MOD=${1:-}; HEDEF=${2:-herhangi}
 case "$#:$MOD" in
-	1:debian-bootloader|1:debian-normal|1:fastboot-normal|2:fastboot-normal) ;;
+	1:debian-bootloader|1:debian-normal|1:debian-erecovery|1:fastboot-normal|2:fastboot-normal) ;;
 	1:anahat-bootloader|1:anahat-normal|1:anahat-erecovery) ;;
-	*) echo "kullanim: kk-reboot debian-bootloader | debian-normal | fastboot-normal [herhangi|22] | anahat-bootloader | anahat-normal | anahat-erecovery" >&2; exit 64;;
+	*) echo "kullanim: kk-reboot debian-bootloader | debian-normal | debian-erecovery | fastboot-normal [herhangi|22] | anahat-bootloader | anahat-normal | anahat-erecovery" >&2; exit 64;;
 esac
 case $HEDEF in herhangi|22) ;; *) echo "DUR: hedef herhangi|22" >&2; exit 64;; esac
 case $MOD in anahat-normal|anahat-erecovery)
@@ -63,6 +65,19 @@ debian-bootloader)
 	log "Debian: systemctl reboot bootloader"
 	"${SSH[@]}" 'sudo -n systemctl reboot bootloader' 2>&1 | tee -a "$LOG"
 	"$KB/kk-izle" fb-gecis 90 fb 2>&1 | tee -a "$LOG"; R=${PIPESTATUS[0]};;
+debian-erecovery)
+	"${SSH[@]}" true 2>/dev/null || { log "DUR: Debian SSH yok; reboot yapilmadi"; exit 1; }
+	U=$("${SSH[@]}" 'uname -r' 2>/dev/null </dev/null); case $U in 4.9*) ;; *) log "DUR: 4.9 Debian degil (uname=$U); reboot yapilmadi"; exit 1;; esac
+	"$KB/kk-usb-kontrol" 60 2>&1 | tee -a "$LOG"
+	[ "${PIPESTATUS[0]}" -eq 0 ] || { log "DUR: USB kararsiz; erecovery'ye alinmadi"; exit 1; }
+	log "Debian: systemctl reboot erecovery"
+	"${SSH[@]}" 'sudo -n systemctl reboot erecovery' 2>&1 | tee -a "$LOG"
+	k=0  # eski oturumun 22'si kapanmadan izlemeye baslanmaz; en cok ~60 sn
+	while nc -z -w 1 172.16.42.1 22 9>&- 2>/dev/null; do
+		[ $k -ge 60 ] && { log "UYARI: 22 60 sn'de kapanmadi"; break; }
+		timeout 2 tail -f /dev/null 9>&-; k=$((k + 3))
+	done
+	"$KB/kk-izle" debian-erec 240 23 2>&1 | tee -a "$LOG"; R=${PIPESTATUS[0]};;
 debian-normal)
 	"${SSH[@]}" true 2>/dev/null || { log "DUR: Debian SSH yok; reboot yapilmadi"; exit 1; }
 	log "Debian: systemctl reboot"
@@ -78,7 +93,7 @@ fastboot-normal)
 anahat-bootloader|anahat-normal|anahat-erecovery)
 	AH=${MOD#anahat-}
 	# 1) ana hat mı (kk-anahat-ssh: yalnız 2222 + uname ^6.12…-kk-g aynı bağlantıda; fd 9 miras), boot_id, reboot-mode DT satırı
-	on=$("$KB/kk-anahat-ssh" 'echo "boot=$(cat /proc/sys/kernel/random/boot_id)"; { sudo -n dmesg; sudo -n journalctl -k -b 0 -o cat --no-pager; } 2>/dev/null | grep -v -e sudo -e systemd | grep -m1 -oE "reboot-mode DT: offset 0x1e1 mask 0xff modlar: [a-z0-9= ]+; beyaz liste TUTTU"; echo ONKOSUL-SON'); r=$?
+	on=$("$KB/kk-anahat-ssh" 'echo "boot=$(cat /proc/sys/kernel/random/boot_id)"; { sudo -n dmesg; sudo -n journalctl -k -b 0 -o cat --no-pager; cat /run/kk/reboot-mode; } 2>/dev/null | grep -v -e sudo -e systemd | grep -m1 -oE "reboot-mode DT: offset 0x1e1 mask 0xff modlar: [a-z0-9= ]+; beyaz liste TUTTU"; echo ONKOSUL-SON'); r=$?
 	B0=$(sed -n 's/^boot=\([0-9a-f-]\{36\}\)$/\1/p' <<<"$on"); RM=$(grep -m1 -o 'modlar: [a-z0-9= ]*;' <<<"$on")
 	{ [ $r -eq 0 ] && grep -qx ONKOSUL-SON <<<"$on" && [ -n "$B0" ]; } || { log "DUR: ana hat 2222/uname/boot_id dogrulanamadi (kk-anahat-ssh cikis=$r); reboot yapilmadi"; exit 1; }
 	log "ana hat: boot=$B0 reboot-mode ${RM:-satir yok (G-2 oncesi imaj)}"

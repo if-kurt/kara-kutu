@@ -1,0 +1,118 @@
+#!/bin/bash
+# Kara Kutu kk-bin (G64; bakımcı onayı 2026-11-24, kural 12): yedek tazeleme. CİHAZDA YALNIZ OKUMA. 4.9 Debian (SSH 22) açıkken; argümansız.
+#   1. kk-backup/SHA256SUMS'taki her *.img için: ad cihazda tam 1 GPT PARTNAME ile eşleşiyorsa canlı bölümün sha256'sı cihazda
+#      hesaplanır ve yedek sha'sıyla karşılaştırılır. PARTNAME'i olmayan girdiler (eMMC boot alanları) ATLANIR: onlar yalnız
+#      kk-olcum ile karşılaştırılır. userdata hiç okunmaz. Canlı bölüm tümüyle sıfır mı ayrıca yazılır (ana makinede sıfır akışı sha'sı).
+#   2. FARKLI çıkan her bölüm taze dökülür: cihazda sha (önce) -> `dd` ile SSH üzerinden aktarım -> ana makine sha -> cihazda sha (sonra).
+#      Önce = ana makine = sonra ise TAMAM; değilse bir kez daha denenir; yine tutmazsa dosya son haliyle kalır, TARAMA'da "DEGISKEN".
+#   3. GPT ham: kullanıcı alanının ilk 34 ve son 33 sektörü (gpt-ilk34.bin, gpt-son33.bin) + sektör sayısı.
+#   4. Çıktı yalnız YENİ dizin /opt/kara-kutu/kk-backup-2 (varsa hiçbir şey yapılmaz): önce kk-backup-2.yapim, en sonda mv.
+#      İçerik: dökümler, TARAMA.txt (bölüm | durum | boyut | canlı sha | yedek sha), SHA256SUMS. Yazma bitleri betikte
+#      kaldırılmaz (settings deny `chmod *kk-backup*`; kural 11): bakımcı elle `chmod -R a-w kk-backup-2` yapar.
+#   kk-backup'a dokunmaz (yalnız SHA256SUMS okunur). Cihazda yazma yok: yalnız `sha256sum`, `dd if=` (of= yok), sysfs okuma.
+# Çıkış 0 = bitti (fark/değişken olabilir; TARAMA'ya bak); 1 = ön koşul; 2 = SSH/okuma hatası (yarım dizin .yapim'de kalır); 64 girdi.
+# Değiştirmek bakımcının onayını gerektirir.
+set -u
+KB=/opt/kara-kutu/tools/kk-bin
+B=/opt/kara-kutu/kk-backup
+H=/opt/kara-kutu/kk-backup-2; Y=$H.yapim
+LOG=/opt/kara-kutu/work/kk-bin-log/kk-bin.log; mkdir -p "${LOG%/*}"
+log() { echo "$(date -u '+%F %T.%3N') UTC [kk-yedek-tazele] $*" | tee -a "$LOG"; }
+SSH=(ssh -o UserKnownHostsFile=$KB/known_hosts -o StrictHostKeyChecking=yes -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 ${KK_KULLANICI:-kk}@172.16.42.1)
+[ $# -eq 0 ] || { echo "kullanim: kk-yedek-tazele (argumansiz)" >&2; exit 64; }
+# --- G49 ortak kilit (kural 17'nin mekanik karşılığı): cihaza dokunan kk-bin çağrıları tek tek. ---
+# flock, work/kk-bin-log/kk-bin.kilit üzerinde, fd 9. Bekleme YOK (-n): kilit doluysa hemen 77, cihaz işlemi yapılmaz.
+# Miras: iç içe kk-bin çağrısı üstünün fd 9'unu (aynı açık dosya tanımı) devralır; flock aynı tanımda yeniden başarılı.
+# Ortam değişkeni (KK_KILIT_SAHIBI) yalnız log içindir; mirası açmaz. Kilidi tutan süreç ve fd 9'u devralan çocukları
+# bitince (SIGKILL dahil) çekirdek kilidi bırakır: bayat kilit olmaz (dosya kalır, içeriği yalnız "son sahip" bilgisi).
+KK_KILIT=/opt/kara-kutu/work/kk-bin-log/kk-bin.kilit
+kk_kilit() {
+	local kl=${KK_KILIT%/*}/kk-bin.log ad=${0##*/} t
+	t=$(date -u '+%F %T.%3N')
+	mkdir -p "${KK_KILIT%/*}" || exit 77
+	if [ /proc/$$/fd/9 -ef "$KK_KILIT" ] && flock -n 9; then
+		echo "$t UTC [$ad] kilit: miras (sahip ${KK_KILIT_SAHIBI:-?}; pid $$)" >> "$kl"; return 0
+	fi
+	if exec 9>>"$KK_KILIT" && flock -n 9; then
+		export KK_KILIT_SAHIBI="pid=$$ $ad"
+		printf 'pid=%s betik=%s arg=%.80s bas=%s UTC\n' $$ "$ad" "$*" "$t" > "$KK_KILIT"
+		echo "$t UTC [$ad] kilit: alindi (pid $$)" >> "$kl"; return 0
+	fi
+	echo "$t UTC [$ad] RED: kk-bin kilidi mesgul (son sahip: $(head -c 200 "$KK_KILIT" 2>/dev/null | tr -d '\n')); cihaz islemi YAPILMADI; cikis 77" | tee -a "$kl" >&2
+	exit 77
+}
+kk_kilit "$@"
+# --- G49 ortak kilit sonu ---
+[ -e "$H" ] && { log "DUR: $H zaten var (uzerine yazilmaz)"; exit 1; }
+[ -e "$Y" ] && { log "DUR: $Y var (onceki yarim calisma; bakımcı inceler)"; exit 1; }
+[ -r "$B/SHA256SUMS" ] || { log "DUR: $B/SHA256SUMS yok"; exit 1; }
+# Cihaz 4.9 Debian mi (SSH 22, uname 4.9)?
+U=$(timeout 30 "${SSH[@]}" 'uname -r' 2>/dev/null </dev/null)
+case "$U" in 4.9*) ;; *) log "DUR: SSH 22'de 4.9 Debian yok (uname='$U')"; exit 1;; esac
+# Cihaz tarafi: tek bolum icin PARTNAME -> dev (tam 1 eslesme), boyut, sha. Ad ana makinede [a-z0-9_] ile sinirli.
+# Cikti: "ad dev boyut sha" ya da "ad YOK n".
+CIHAZ_SHA='set -u; a=$1; d=; n=0
+for u in /sys/class/block/mmcblk0p*/uevent; do grep -qx "PARTNAME=$a" "$u" && { n=$((n+1)); d=$(sed -n "s/^DEVNAME=//p" "$u"); }; done
+[ "$n" -eq 1 ] && [ -n "$d" ] || { echo "$a YOK $n"; exit 0; }
+echo "$a $d $(( $(cat /sys/class/block/$d/size) * 512 )) $(sha256sum /dev/$d | cut -c1-64)"'
+CIHAZ_DD='set -u; a=$1; d=; n=0
+for u in /sys/class/block/mmcblk0p*/uevent; do grep -qx "PARTNAME=$a" "$u" && { n=$((n+1)); d=$(sed -n "s/^DEVNAME=//p" "$u"); }; done
+[ "$n" -eq 1 ] && [ -n "$d" ] || exit 3
+exec dd if=/dev/$d bs=4M status=none'
+csha() { timeout 900 "${SSH[@]}" "sudo -n sh -c '$CIHAZ_SHA' kk $1" </dev/null 2>/dev/null; }
+umask 022
+mkdir -m 0755 "$Y" || { log "DUR: $Y yaratilamadi"; exit 1; }
+T=$Y/TARAMA.txt
+{ echo "# kk-yedek-tazele $(date -u '+%F %T') UTC; cekirdek $U; kaynak $B/SHA256SUMS"
+  echo "# bolum | durum | boyut | canli sha | yedek sha | not"; } > "$T.tmp"
+declare -A ZS
+sifir_sha() { [ -n "${ZS[$1]:-}" ] || ZS[$1]=$(head -c "$1" /dev/zero | sha256sum | cut -c1-64); echo "${ZS[$1]}"; }
+n_ayni=0; n_fark=0; n_atla=0; n_deg=0; FARK=()
+while read -r ysha dosya; do
+	dosya=${dosya#\*}; case $dosya in *.img) ;; *) continue;; esac
+	a=${dosya%.img}
+	[[ $a =~ ^[a-z0-9_]{1,40}$ ]] || { echo "$a | ATLANDI | - | - | $ysha | ad bicimi" >> "$T.tmp"; n_atla=$((n_atla+1)); continue; }
+	[ "$a" = userdata ] && continue
+	S=$(csha "$a"); set -- $S
+	if [ "${2:-}" = YOK ]; then echo "$a | ATLANDI | - | - | $ysha | PARTNAME eslesmesi ${3:-?} (kk-olcum alani ya da yok)" >> "$T.tmp"; n_atla=$((n_atla+1)); continue; fi
+	[ $# -eq 4 ] && [ "$1" = "$a" ] && [[ $4 =~ ^[0-9a-f]{64}$ ]] || { log "DUR: $a sha okunamadi ('$S')"; mv "$T.tmp" "$T" 2>/dev/null; exit 2; }
+	boy=$3; csh=$4; z=""; [ "$csh" = "$(sifir_sha "$boy")" ] && z="canli tum sifir"
+	if [ "$csh" = "$ysha" ]; then echo "$a | AYNI | $boy | $csh | $ysha | $z" >> "$T.tmp"; n_ayni=$((n_ayni+1))
+	else echo "$a | FARKLI | $boy | $csh | $ysha | $z" >> "$T.tmp"; n_fark=$((n_fark+1)); FARK+=("$a"); fi
+done < "$B/SHA256SUMS"
+log "karsilastirma: ayni=$n_ayni farkli=$n_fark atlandi=$n_atla (farkli: ${FARK[*]:-yok})"
+dok() {	# dok <ad> -> 0 tutarli, 1 degisken, 2 hata
+	local a=$1 o1 o2 t s
+	o1=$(csha "$a" | cut -d' ' -f4)
+	timeout 1800 "${SSH[@]}" "sudo -n sh -c '$CIHAZ_DD' kk $a" </dev/null > "$Y/$a.img" 2>/dev/null || return 2
+	t=$(sha256sum "$Y/$a.img" | cut -c1-64)
+	o2=$(csha "$a" | cut -d' ' -f4)
+	s=$(stat -c %s "$Y/$a.img")
+	echo "$a | DOKUM | $s | ana-makine $t | once $o1 sonra $o2 |" >> "$T.tmp"
+	[[ $o1 =~ ^[0-9a-f]{64}$ ]] || return 2
+	[ "$o1" = "$t" ] && [ "$t" = "$o2" ] && return 0
+	return 1
+}
+for a in "${FARK[@]}"; do
+	dok "$a"; r=$?
+	if [ $r -eq 1 ]; then rm -f "$Y/$a.img"; dok "$a"; r=$?; fi
+	case $r in
+		0) log "dokum $a: TAMAM";;
+		1) log "dokum $a: DEGISKEN (okuma sirasinda bolum degisti; son hali kaldi)"; n_deg=$((n_deg+1)); echo "$a | DEGISKEN | | | | iki deneme" >> "$T.tmp";;
+		*) log "DUR: dokum $a basarisiz"; mv "$T.tmp" "$T" 2>/dev/null; exit 2;;
+	esac
+done
+# GPT ham: kullanici alaninin ilk 34 ve son 33 sektoru
+NS=$(timeout 30 "${SSH[@]}" 'cat /sys/class/block/mmcblk0/size' </dev/null 2>/dev/null)
+[[ $NS =~ ^[0-9]{4,12}$ ]] || { log "DUR: mmcblk0 boyutu okunamadi"; mv "$T.tmp" "$T" 2>/dev/null; exit 2; }
+timeout 120 "${SSH[@]}" 'sudo -n dd if=/dev/mmcblk0 bs=512 count=34 status=none' </dev/null > "$Y/gpt-ilk34.bin" 2>/dev/null || { log "DUR: GPT ilk okunamadi"; exit 2; }
+timeout 120 "${SSH[@]}" "sudo -n dd if=/dev/mmcblk0 bs=512 skip=$((NS - 33)) count=33 status=none" </dev/null > "$Y/gpt-son33.bin" 2>/dev/null || { log "DUR: GPT son okunamadi"; exit 2; }
+[ "$(stat -c %s "$Y/gpt-ilk34.bin")" = 17408 ] && [ "$(stat -c %s "$Y/gpt-son33.bin")" = 16896 ] || { log "DUR: GPT dokum boyutu"; exit 2; }
+[ "$(dd if="$Y/gpt-ilk34.bin" bs=1 skip=512 count=8 status=none)" = "EFI PART" ] || log "UYARI: gpt-ilk34 LBA1'de 'EFI PART' yok"
+[ "$(dd if="$Y/gpt-son33.bin" bs=1 skip=$((32 * 512)) count=8 status=none)" = "EFI PART" ] || log "UYARI: gpt-son33 son sektorde 'EFI PART' yok"
+echo "gpt | DOKUM | ilk34 + son33 | mmcblk0 sektor=$NS | | ilk34=0..33, son33=$((NS - 33))..$((NS - 1))" >> "$T.tmp"
+mv "$T.tmp" "$T"
+( shopt -s nullglob; cd "$Y" && sha256sum -- *.img *.bin TARAMA.txt > SHA256SUMS ) || { log "DUR: SHA256SUMS yazilamadi"; exit 2; }
+mv "$Y" "$H" || { log "DUR: $Y -> $H tasinamadi"; exit 2; }
+log "BITTI: $H ($(grep -c . "$H/SHA256SUMS") dosya; ayni=$n_ayni farkli=$n_fark degisken=$n_deg atlandi=$n_atla); yazma bitleri: bakımcı elle kaldirir"
+exit 0
