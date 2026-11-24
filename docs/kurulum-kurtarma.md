@@ -44,17 +44,32 @@ Cihaz ana makineye USB NCM ile bağlanır. Ana makine arayüzüne `172.16.42.2/2
 Tek adımlık, kontrollü yol:
 
 1. `kk-usb-kontrol`: USB kararlılığı.
-2. Cihaz açıkken `kk-reboot debian-bootloader` (ana hat Debian'ından `kk-anahat-ssh 'sudo -n systemctl reboot'`).
+2. Cihaz açıkken `kk-reboot debian-bootloader` (4.9 Debian'dan) ya da `kk-reboot anahat-bootloader` (ana hat Debian'ından).
 3. `fastboot devices` cihazı gösterene kadar bekleyin.
 4. `kk-flash-kernel <imaj>`: imajı yalnızca `kernel` bölümüne, yalnızca `-s "$KK_SERI"` ile yazar. Boyut, `ANDROID!` magic'i ve sha256 denetlenir. Yeniden başlatma yapmaz.
 5. `kk-reboot fastboot-normal`.
 6. 4 dakika içinde cihaz SSH (22 / 2222) ya da telnet (23 / 2323) ucunda görünmezse `fastboot devices`'a bakın; fastboot'taysa `kk-v51-don` ile bilinen iyi çekirdeği yazın.
 
-Ana hat çekirdeği testlerinden sonra her seferinde bilinen iyi 4.9 çekirdeğine dönülür.
+Günlük sistem ana hat çekirdeğidir. Bilinen iyi 4.9 çekirdeği **v5.2**'dir (eMMC yazma kapılı; `kernel-4.9/`). `kk-v51-don` (ad tarihseldir) bunu yazar, sonra Debian'da `kernel` bölümünün sha'sını ve kapının `ACIK 1` olduğunu denetler. Bilinen iyi 4.9'u ilk kez yazmak için `kk-v52-yaz` kullanılır; o başarısız olursa bir önceki 4.9 imajına döner.
 
 ## 4. Kurtarma
 
-Kernel açılmıyorsa ve cihaz fastboot'a da düşmüyorsa, eRecovery yuvasındaki kendi kurtarma ortamı (telnet 23) kullanılır. Sıra: **aktar, kernel, bfr, reboot**.
+### Belirti → yol (ana makineden yalnız okuma; açılıştan 4 dk sonra bakın)
+
+| Görülen | Anlamı | Yol |
+|---|---|---|
+| SSH 2222 / telnet 2323 | Ana hat (günlük sistem) | Bir şey gerekmez |
+| SSH 22 (USB ya da Wi-Fi) | 4.9 Debian: v5.2 ya da v5.2e'nin 45 dk sonra geçtiği Debian | Bir şey gerekmez; ana hatta dönmek için fastboot üzerinden çekirdek flaşı |
+| telnet 23 | eRecovery yuvasındaki kurtarma (v5.2e) | Aşağıdaki sıra. Ana makine yoksa 45 dk sonra 4.9 Debian'a kendiliğinden geçer |
+| `fastboot devices` cihazı gösteriyor | Önyükleyici sağlam | `kk-usb-kontrol`, sonra `kk-v51-don` |
+| USB'de stok eRecovery (boş CD-ROM), ağ yok | Stok kurtarma ekranı | Cihazın başında: hiçbir seçenek seçilmez ("Download … and recovery" ve silme seçenekleri asla); USB takılıyken Vol Down + Power → fastboot |
+| USB'de hiçbir şey, Wi-Fi'da da yok | Güç, kablo, port ya da erken takılma | Kablo/port; pil boşsa adaptörde ~30 dk; Vol Down + Power (fastboot) ya da Vol Up + Power (telnet 23) |
+
+Bu yazılım yollarının hiçbiri işlemiyorsa (ne fastboot ne telnet 23 geliyor) yapılacak yazılım adımı kalmamıştır: cihaz **yetkili servise** götürülür. Düşük seviyeli donanım yolları bu rehberin konusu değildir.
+
+### Kurtarma ortamı (telnet 23)
+
+Kernel açılmıyorsa ve cihaz fastboot'a da düşmüyorsa, eRecovery yuvasındaki kendi kurtarma ortamı (v5.2e, telnet 23) kullanılır. 4.9 Debian'dan bilerek girmek için `kk-reboot debian-erecovery`, ana hat Debian'ından `kk-reboot anahat-erecovery`. Kurtarma çekirdeğinin yazma kapısı yalnız `userdata`, `kernel` ve `misc`/`rrecord`'un ilk 8 sektörüne izin verir. Sıra: **aktar, kernel, bfr, reboot**.
 
 - `kk-kurtarma durum`: salt okuma; boot-hata nedeni, `misc`/`rrecord` ilk baytları, bazı bölümlerin sha'ları.
 - `kk-kurtarma aktar`: bilinen iyi imaj ile iki cihaz betiğini `nc` ile kurtarma ortamının `/tmp` bölgesine aktarır; üçünün sha256'sı denetlenir.
@@ -68,6 +83,24 @@ Telnet 23 de yanıt vermiyorsa: ekranı ve tuşları olan birinin cihazın baş�
 
 - Ana hat çekirdeği donarsa SP805 sıfırlaması boot-hata sayılır ve açılış eRecovery yuvasına gider (fastboot'a değil). `kk-kurtarma bfr` bayrağı temizler.
 - Sebepsiz sıfırlamadan sonraki açılış normal geçebilir, bir sonraki yeniden başlatma kurtarmaya düşebilir.
+- Panik (`panic=10`):
+  - 10 sn sonra yeniden başlatma olur ve açılış doğrudan ana hatta gider (~1 dk). Kök dosya sistemi açılışta e2fsck ile denetlenir; journal oynatılır.
+  - Önyükleyici bu sıfırlamayı anormal sayar: **bir sonraki** yeniden başlatma (fastboot'a gitmek için olan da) kurtarma yuvasına düşer.
+  - Ana makine bağlıysa `kk-kurtarma-oto` 20 dk sonra aktar → bfr → reboot 2222 yapar.
+- Ana makine yokken iki ayrı emniyet devrededir:
+  - `kk-fb-oluadam` (20 dk fastboot → bilinen iyi çekirdek);
+  - `kk-kurtarma-oto` (20 dk kurtarma → ana hat).
+  - Uzun bir elle çalışmadan önce kapatma dosyaları konur, iş bitince kaldırılır.
+
+### Yedekler
+
+- Stok yedek bir kez alınır ve salt okunurdur. Taze yedek `kk-yedek-tazele` ile alınır:
+  - 4.9 Debian açıkken, cihazda yalnız okuma yapar;
+  - stok yedekten farklı çıkan bölümleri ve GPT'nin ham ilk/son sektörlerini yeni bir dizine döker;
+  - dizinde karşılaştırma tablosu ve `SHA256SUMS` bulunur.
+- İki dizin de ayda bir `sha256sum -c` ile doğrulanır.
+- Bu kartta diskin sonunda yedek GPT yoktur (birincil başlığın gösterdiği son LBA boştur). Tek kopya birincil GPT'dir, bu yüzden ham kopyası alınmalıdır.
+- `oeminfo`, `nvme` ve modem NV dökümleri cihaza özgüdür; paylaşılmaz.
 - Ana hatta kapatma komutu yoktur; kapatma yerine yeniden başlatma kullanılır.
 - Cihaz şarj adaptöründeyken ana hat ağsızdır. Kabloyu yalnızca 4.9 açıkken değiştirin.
 
