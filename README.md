@@ -21,9 +21,8 @@ The long-term goal is a phone-sized 24/7 low-power Linux server running **its ow
 
 Working research project, not an installer.
 
-- Daily system: a custom 4.9 kernel (fork of the vendor tree plus an embedded initramfs) running Debian 12.
-- Mainline 6.12.117 is brought up in stages in a separate repository, [`linux-kirin710`](https://github.com/if-kurt/linux-kirin710) (may be private): charging phases 1-3 with a thermal fuse, an efficiency stage, time-boxed eMMC write gating, and Wi-Fi bring-up (the Hi1102 card is detected; the firmware handshake is the next step).
-- Every mainline test session ends with a return to the known-good 4.9 kernel.
+- Daily system: mainline 6.12.117 from the separate repository [`linux-kirin710`](https://github.com/if-kurt/linux-kirin710), running Debian 12 on a read-write root on the userdata partition behind a kernel write gate and a runaway-write watchdog. It has charging phases 1-3 with a thermal fuse, an efficiency stage, and Wi-Fi on the Hi1102 chip (IPv4 through a filter; SDIO at 3.2 MHz, about 1 MB/s).
+- A custom 4.9 kernel (fork of the vendor tree plus an embedded initramfs) stays as the known-good fallback and as the rescue system in the recovery slot.
 
 ## Repository layout
 
@@ -86,7 +85,7 @@ GPL-2.0-only for the scripts, tools and documentation in this repository (full t
 
 Kara Kutu, Huawei P30 Lite'ı (Kirin 710) Android olmadan, başsız (headless) bir Linux kartı olarak çalıştırmak için bir araç setidir. Asıl hedef: kendi ana hat (mainline) Linux çekirdeği, kendi Wi-Fi ve güç yönetimi desteği, 7/24 çalışan düşük güçlü bir sunucu ve ileride GPU; ayrıca Debian, Alpine, Droidian, postmarketOS gibi dağıtımları istenen anda kurup kaldırabilen, her adımı geri alınabilir bir araç seti.
 
-Cihazda şu an kendi 4.9 çekirdeğimiz (gömülü initramfs) ve Debian 12 günlük sistem olarak çalışır; ana hat 6.12.117 çekirdeği aşama aşama taşınmaktadır (ayrı depo: [`linux-kirin710`](https://github.com/if-kurt/linux-kirin710)).
+Cihazda günlük sistem ana hat 6.12.117 çekirdeği ve Debian 12'dir (Wi-Fi dahil); kendi 4.9 çekirdeğimiz bilinen iyi yedek ve kurtarma ortamı olarak durur (ana hat çekirdeği ayrı depoda: [`linux-kirin710`](https://github.com/if-kurt/linux-kirin710)).
 
 Tasarımın özü güvenliktir: asla yazılmayan bölüm listesi (önyükleyici, firmware, kimlik/kalibrasyon, modem), cihaz seri numarasının her komutta açıkça verilmesi, özetle sabitlenmiş `kk-bin` sarmalayıcı betikleri, ana hat çekirdeğinde yalnızca izin listeli yazmalar, sıcaklık sigortası, ölü adam sayaçları ve betikli kurtarma. Ayrıntı: `docs/guvenlik-tasarimi.md`; kurulum ve kurtarma: `docs/kurulum-kurtarma.md`.
 
