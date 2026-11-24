@@ -21,8 +21,8 @@ The long-term goal is a phone-sized 24/7 low-power Linux server running **its ow
 
 Working research project, not an installer.
 
-- Daily system: mainline 6.12.117 from the separate repository [`linux-kirin710`](https://github.com/if-kurt/linux-kirin710), running Debian 12 on a read-write root on the userdata partition behind a kernel write gate and a runaway-write watchdog. It has charging phases 1-3 with a thermal fuse, an efficiency stage, and Wi-Fi on the Hi1102 chip (IPv4 through a filter; SDIO at 3.2 MHz, about 1 MB/s).
-- A custom 4.9 kernel (fork of the vendor tree plus an embedded initramfs) stays as the known-good fallback and as the rescue system in the recovery slot.
+- Daily system: mainline 6.12.117 from the separate repository [`linux-kirin710`](https://github.com/if-kurt/linux-kirin710), running Debian 12 on a read-write root on the userdata partition behind a kernel write gate and a runaway-write watchdog. It has charging phases 1-3 with a thermal fuse, an efficiency stage, and Wi-Fi on the Hi1102 chip (IPv4 through a filter; SDIO clock on the 25 MHz path, about 2-4 MB/s over SSH). A kernel panic reboots after 10 s.
+- A custom 4.9 kernel stays as the safety net, now with its own eMMC write gate ([`kernel-4.9/`](kernel-4.9/README.md)): v5.2 is the known-good fallback for the normal slot; v5.2e is the rescue system in the recovery slot and switches to the 4.9 Debian (reachable over Wi-Fi) when no operator connects within 45 minutes.
 
 ## Repository layout
 
@@ -33,7 +33,8 @@ Working research project, not an installer.
 | `docs/guvenlik-tasarimi.md` | Safety design: protected partitions, write gates, allow-lists, thermal fuse, dead-man timers (Turkish, English summary at the top) |
 | `docs/kurulum-kurtarma.md` | Boot modes, install and recovery procedures (Turkish) |
 | `docs/konu/` | Topic notes: tooling pitfalls, kernel log handling, QEMU (Turkish) |
-| `tools/kk-bin/` | Host-side wrapper scripts. Each validates its input, takes a lock and logs. Includes the dead-man timers and the scripted recovery (`kk-kurtarma`, `kk-kurtarma-oto`) |
+| `tools/kk-bin/` | Host-side wrapper scripts. Each validates its input, takes a lock and logs. Includes the dead-man timers, the scripted recovery (`kk-kurtarma`, `kk-kurtarma-oto`), the 4.9 fallback writers (`kk-v52-yaz`, `kk-v51-don`, `cihaz/dd-erec-v52e.sh`) and a read-only backup refresh (`kk-yedek-tazele`) |
+| `kernel-4.9/` | Patches, configurations and the rescue init for the 4.9 fallback (v5.2) and recovery slot (v5.2e) kernels, with base commit and build notes |
 | `tools/py/` | Image tools: AVB info, test boot image builder, Huawei UPDATE.APP unpacker, EROFS reader, block diff |
 | `tools/qemu/` | QEMU VM slot helper used for regression runs |
 | `initramfs/` | Early-boot scripts embedded in the kernel image: `init`, write gate (`kk-alan`), health watchdog (`kk-saglik`), idle watchdog, zram setup, Wi-Fi firmware loader and watchdog, rescue shell helper |
@@ -85,7 +86,7 @@ GPL-2.0-only for the scripts, tools and documentation in this repository (full t
 
 Kara Kutu, Huawei P30 Lite'ı (Kirin 710) Android olmadan, başsız (headless) bir Linux kartı olarak çalıştırmak için bir araç setidir. Asıl hedef: kendi ana hat (mainline) Linux çekirdeği, kendi Wi-Fi ve güç yönetimi desteği, 7/24 çalışan düşük güçlü bir sunucu ve ileride GPU; ayrıca Debian, Alpine, Droidian, postmarketOS gibi dağıtımları istenen anda kurup kaldırabilen, her adımı geri alınabilir bir araç seti.
 
-Cihazda günlük sistem ana hat 6.12.117 çekirdeği ve Debian 12'dir (Wi-Fi dahil); kendi 4.9 çekirdeğimiz bilinen iyi yedek ve kurtarma ortamı olarak durur (ana hat çekirdeği ayrı depoda: [`linux-kirin710`](https://github.com/if-kurt/linux-kirin710)).
+Cihazda günlük sistem ana hat 6.12.117 çekirdeği ve Debian 12'dir (ana hat çekirdeği ayrı depoda: [`linux-kirin710`](https://github.com/if-kurt/linux-kirin710)). Wi-Fi SDIO 25 MHz yolunda, SSH ile ~2-4 MB/s; panikte 10 sn sonra yeniden başlatır. Kendi 4.9 çekirdeğimiz eMMC yazma kapısıyla yedekte durur (`kernel-4.9/`): v5.2 bilinen iyi yedek, v5.2e kurtarma yuvasında (45 dk içinde bağlanan olmazsa Wi-Fi'den erişilen 4.9 Debian'a geçer).
 
 Tasarımın özü güvenliktir: asla yazılmayan bölüm listesi (önyükleyici, firmware, kimlik/kalibrasyon, modem), cihaz seri numarasının her komutta açıkça verilmesi, özetle sabitlenmiş `kk-bin` sarmalayıcı betikleri, ana hat çekirdeğinde yalnızca izin listeli yazmalar, sıcaklık sigortası, ölü adam sayaçları ve betikli kurtarma. Ayrıntı: `docs/guvenlik-tasarimi.md`; kurulum ve kurtarma: `docs/kurulum-kurtarma.md`.
 
