@@ -1,0 +1,44 @@
+From a3f057c74d72300aaf83cc3b6aca3842b2a11cf6 Mon Sep 17 00:00:00 2001
+From: Kara Kutu <kk@localhost>
+Date: Mon, 9 Nov 2026 22:02:07 +0000
+Subject: [PATCH 2/3] power: hisi: coul: match the EMUI 9 hi6555v200 coul
+ compatible
+
+P30 lite (MAR) EMUI 9 device trees describe the HI6555V200 coulometer as
+"hisilicon_hi6555v200_coul" (the stock 4.9.111 driver name), while this
+tree's generalized hi6xxx driver only matched "hisilicon_hi6xxx_coul".
+The coul never probed, so coul_core failed (-1, no ops), charging_core
+failed to get battery params (-EINVAL) and huawei_charger failed (-EINVAL):
+no battery data and no charger control.
+
+Add the EMUI 9 compatible to the OF match table; the driver already uses
+the HI6555V200 register map (CONFIG_HISI_COUL_HI6555V200) and reads only
+"coulirq" and coul_core/r_coul_mohm, both present in these DTs.
+
+---
+ drivers/power/hisi/coul/hi6xxx/hisi_hi6xxx_coul.c | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/drivers/power/hisi/coul/hi6xxx/hisi_hi6xxx_coul.c b/drivers/power/hisi/coul/hi6xxx/hisi_hi6xxx_coul.c
+index 3bc64c5da..34224e698 100755
+--- a/drivers/power/hisi/coul/hi6xxx/hisi_hi6xxx_coul.c
++++ b/drivers/power/hisi/coul/hi6xxx/hisi_hi6xxx_coul.c
+@@ -2108,6 +2108,15 @@ static struct of_device_id hi6xxx_coul_match_table[] =
+     {
+           .compatible = "hisilicon_hi6xxx_coul",
+     },
++    /*
++     * kk (Kara Kutu): EMUI 9 kirin710 DTs (P30 lite / MAR) name the same
++     * HI6555V200 coulometer "hisilicon_hi6555v200_coul" (stock 4.9.111 driver
++     * name). Without this the coul never probes, coul_core fails (-1) and
++     * charging_core / huawei_charger fail with -EINVAL.
++     */
++    {
++          .compatible = "hisilicon_hi6555v200_coul",
++    },
+     {},
+ };
+ 
+-- 
+2.43.0
+

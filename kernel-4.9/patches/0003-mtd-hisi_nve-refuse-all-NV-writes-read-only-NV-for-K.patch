@@ -1,0 +1,139 @@
+From d8bc7451d0825589cd69461bffe5164fa4e3cd54 Mon Sep 17 00:00:00 2001
+From: Kara Kutu <kk@localhost>
+Date: Mon, 9 Nov 2026 23:04:37 +0000
+Subject: [PATCH 3/3] mtd: hisi_nve: refuse all NV writes (read-only NV for
+ Kara Kutu)
+
+Our kernel must never write the nvme (NV) partition (device calibration,
+battery learning data, identity). Refuse every write and keep reads:
+
+- hisi_nve_direct_access_for_ramdisk(): non-read requests (in-kernel callers
+  and the /dev/nve ioctl) return -EROFS before the ramdisk copy, CRC or
+  current partition id are touched; "kk: NV write blocked (index N, name,
+  size, caller, total)" is logged.
+- nve_write(): every raw block write (also nve_restore()/erase paths)
+  returns -EROFS and logs "kk: NV write blocked (raw offset ...)".
+
+-EROFS rather than -EPERM because some callers (hisi_ini) only treat
+"ret < -1" as failure. Logging is limited to the first 20 blocks and every
+100th afterwards; coul_core retries a failed save every 20 s.
+
+Callers checked (coul_core, asw_protect, soh_core, rtc-hisi-pmic-spmi,
+hisi_ini, tp_color, tpkit): all log the error and keep running; coul keeps
+the data in RAM and retries.
+
+---
+ drivers/mtd/hisi_nve.c | 87 +++++++++++++++++-------------------------
+ 1 file changed, 36 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/mtd/hisi_nve.c b/drivers/mtd/hisi_nve.c
+index a416ad8d3..410e5e10a 100644
+--- a/drivers/mtd/hisi_nve.c
++++ b/drivers/mtd/hisi_nve.c
+@@ -252,60 +252,32 @@ static int nve_read(loff_t from, size_t len, u_char *buf)
+  *          @ len:total bytes that will be written from emmc.
+  *          @ buf:given buffer whose bytes will be written to emmc.
+  */
+-static int nve_write(loff_t from, size_t len, u_char *buf)
+-{
+-	int ret;
+-	int fd;
+-	/*lint -e501*/
+-	mm_segment_t oldfs = get_fs();
+-	set_fs(get_ds());
+-	/*lint +e501*/
+-	fd = (int)sys_open(nve_block_device_name, O_RDWR,
+-		      (int)S_IRWXU | S_IRWXG | S_IRWXO);
+-
+-	if (fd < 0) {
+-		pr_err("[NVE][%s]open nv block device failed, and fd = %x!\n",
+-		       __func__, fd);
+-		ret = -ENODEV;
+-		goto out;
+-	}
+-
+-	ret = (int)sys_lseek((unsigned int)fd, from, SEEK_SET);
+-	if (ret == -1) {
+-		pr_err("[NVE][%s] Fatal seek error, read flash from = "
+-				"0x%llx, len = 0x%zx, ret = 0x%x.\n",
+-		       __func__, from, len, ret);
+-		ret = -EIO;
+-		goto out;
+-	}
++/*
++ * kk (Kara Kutu): the nvme (NV) partition is never written by our kernel.
++ * Every NV write is refused with -EROFS (not -EPERM: some callers test
++ * "ret < -1") and reported as "kk: NV write blocked (...)". Reads still work.
++ * The message is printed for the first KK_NV_LOG_FIRST blocks, then every
++ * KK_NV_LOG_EVERY-th, so callers that retry periodically (coul: 20 s)
++ * cannot flood the log.
++ */
++#define KK_NV_LOG_FIRST	20
++#define KK_NV_LOG_EVERY	100
++static atomic_t kk_nv_blocked = ATOMIC_INIT(0);
+ 
+-	ret = (int)sys_write((unsigned int)fd, (char *)buf, len);
+-	if (ret == -1) {
+-		pr_err("[NVE][%s] Fatal write error, read flash from "
+-				"= 0x%llx, len = 0x%zx, ret = 0x%x.\n",
+-		       __func__, from, len, ret);
+-		ret = -EIO;
+-		goto out;
+-	}
++static bool kk_nv_log_this(void)
++{
++	int n = atomic_inc_return(&kk_nv_blocked);
+ 
+-	ret = (int)sys_fsync((unsigned int)fd);
+-	if (ret < 0) {
+-		pr_err("[NVE][%s] Fatal sync error, read flash from = "
+-				"0x%llx, len = 0x%zx, ret = 0x%x.\n",
+-		       __func__, from, len, ret);
+-		ret = -EIO;
+-		goto out;
+-	}
+-	sys_close((unsigned int)fd);
++	return n <= KK_NV_LOG_FIRST || (n % KK_NV_LOG_EVERY) == 0;
++}
+ 
+-	set_fs(oldfs);
+-	return 0;
+-out:
+-	if (fd >= 0) {
+-		sys_close((unsigned int)fd);
+-	}
+-	set_fs(oldfs);
+-	return ret;
++static int nve_write(loff_t from, size_t len, u_char *buf)
++{
++	/* kk: last line of defence, covers nve_restore()/erase too */
++	if (kk_nv_log_this())
++		pr_err("kk: NV write blocked (raw offset 0x%llx, len 0x%zx, total %d)\n",
++		       from, len, atomic_read(&kk_nv_blocked));
++	return -EROFS;
+ }
+ 
+ /*
+@@ -1165,6 +1137,19 @@ int hisi_nve_direct_access_for_ramdisk(struct hisi_nve_info_user *user_info){
+ 	}
+ #endif /* CONFIG_HISI_NVE_WHITELIST */
+ 
++	/*
++	 * kk: refuse writes before the ramdisk copy, CRC or current id are
++	 * touched, so readers keep seeing the on-flash contents.
++	 */
++	if (user_info->nv_operation != NV_READ) {
++		if (kk_nv_log_this())
++			pr_err("kk: NV write blocked (index %u, name %.8s, size %u, caller %s, total %d)\n",
++			       user_info->nv_number, user_info->nv_name,
++			       user_info->valid_size, current->comm,
++			       atomic_read(&kk_nv_blocked));
++		return -EROFS;
++	}
++
+ 	/*get nve partition header to check nv number*/
+ 	nve_partition_header = &g_nve_struct->nve_current_ramdisk->header;
+ 	if (user_info->nv_number >= nve_partition_header->valid_items) {
+-- 
+2.43.0
+

@@ -1,0 +1,597 @@
+#!/bin/sh
+# Kara Kutu kurtarma initramfs'i — /init (PID 1)            Görev 6B v1 → Görev 13 v4
+#
+# Yapar:  proc/sys/devtmpfs/devpts/run/configfs bağlar; USB gadget (NCM, olmazsa RNDIS)
+#         172.16.42.1/24, udhcpd (karşı tarafa 172.16.42.2), telnetd (sadece 172.16.42.1);
+#         /run/kk-report.txt raporu; uptime + batarya logu (watchdog gözlemi).
+#  v4:    - Kalıcı depolama: userdata bölümünde etiketi "kkdata" olan ext4 varsa
+#           e2fsck -p + /data'ya bağlar; loglar /data/kk/logs/boot-NNNN/ altına yazılır
+#           (/run/kk-*.log oraya sembolik bağ). Yoksa her şey eskisi gibi RAM'de.
+#         - Şarj limiti (arka plan): capacity ≥ CHG_HI → enable_charger=0, ≤ CHG_LO → 1;
+#           pil ≥ CHG_HOT → 0, < CHG_COOL olunca normal kurala döner.
+#         - Sıcaklık uyarısı: SoC ≥ WARN_SOC, pil ≥ WARN_BAT (yalnız log).
+# Yapmaz: Android'e devretmez; userdata dışındaki hiçbir bölümü bağlamaz/yazmaz.
+#         Biçimlendirme YALNIZ elle: /sbin/kk-format-data EVET-SIL.
+# Güvenlik anahtarı (v4.1): BAKIM modunda (/data/kk/state/keep yok) gadget UDC'ye
+#         bağlanamazsa FAIL_DELAY sn sonra, ya da KEEP_TIMEOUT sn içinde /run/kk-keep
+#         oluşmazsa reboot-bl ile fastboot'a döner. KALICI modda (keep var) otomatik
+#         fastboot yok, yalnız log. "USB kuruldu" = gadget UDC'ye bağlı (host gerekmez).
+#
+# Loglar: /dev/kmsg ("kk: " önekli), /run/kk-init.log, /run/kk-uptime.log,
+#         /run/kk-charge.log, /run/kk-console.log (kkdata bağlıysa kalıcı)
+
+export PATH=/sbin:/bin:/usr/sbin:/usr/bin
+KK_VER="kk-rescue v5.2e (G64: eMMC kapisi + 45 dk oturum zamanlayicisi -> 4.9 Debian)"
+KEEP_TIMEOUT=600          # sn; /run/kk-keep bu süre içinde oluşmazsa fastboot
+FAIL_DELAY=20             # sn; USB kurulamazsa fastboot'a dönmeden önce
+UPTIME_EVERY=30           # sn; uptime/batarya log aralığı
+UDC=ff100000.dwc3
+IP_DEV=172.16.42.1
+IP_HOST=172.16.42.2
+MAC_DEV=02:4b:4b:00:00:01
+MAC_HOST=02:4b:4b:00:00:02
+G=/sys/kernel/config/usb_gadget/g1
+BAT=/sys/class/power_supply/Battery
+# şarj limiti (Görev 13)
+CHG_NODE=/sys/class/hw_power/charger/charge_data/enable_charger
+CHG_HI=60                 # % ; bu ve üstünde şarj kapatılır
+CHG_LO=50                 # % ; bu ve altında şarj açılır
+CHG_HOT=420               # 0,1 °C ; pil bu ve üstünde → şarj kapalı
+CHG_COOL=380              # 0,1 °C ; sıcak durumdan çıkış
+CHG_EVERY=30              # sn
+# sıcaklık uyarısı (Görev 13)
+WARN_SOC=55000            # m°C (thermal_zone0 soc_thermal)
+WARN_BAT=420              # 0,1 °C
+# kalıcı depolama (Görev 13)
+DATA_LABEL=kkdata
+DATA_MNT=/data
+LOG_KEEP=50               # en fazla bu kadar boot-NNNN log dizini tutulur
+KMSG_MAX=$((20 * 1024 * 1024))   # kmsg.log sınırı (v5); aşınca kmsg.log.1'e kopyalanıp kesilir
+# işletim sistemi seçimi (v5, Görev 15)
+OS_ROOT_DEBIAN=/data/kk/os/debian
+OS_MAX_TRIES=3            # switch_root öncesi artan sayaç bu değere ulaşırsa kurtarma
+NEWROOT=/newroot
+# G63 (v5.2e) oturum zamanlayicisi: acilistan OTO_SURE sn icinde telnet oturumu (kk-kurtarma) gelmezse 4.9 Debian'a gec
+OTO_SURE=2700             # sn (uptime; G64: kk-kurtarma-oto 20 dk + pay)
+OTO_ARDISIK_MAX=3         # oturumsuz ardisik otomatik gecis; asinca kurtarmada kal (dongu siniri)
+OTO_GUN_MAX=4             # 24 saatte en cok (yalniz saat guvenilirse; RTC < 2023 ise yok sayilir)
+OTO_KAPI=/sys/kernel/kk_emmc_kapi
+
+# ---------------------------------------------------------------- temel bağlamalar
+/bin/busybox mount -t proc     proc     /proc
+/bin/busybox mount -t sysfs    sysfs    /sys
+/bin/busybox mount -t devtmpfs devtmpfs /dev
+/bin/busybox mkdir -p /dev/pts
+/bin/busybox mount -t devpts   devpts   /dev/pts
+/bin/busybox mount -t tmpfs -o mode=0755 tmpfs /run
+/bin/busybox mount -t configfs configfs /sys/kernel/config 2>/dev/null
+/bin/busybox --install -s
+exec >>/run/kk-console.log 2>&1 </dev/null
+
+up() { cut -d' ' -f1 /proc/uptime; }
+log() {
+	echo "<6>kk: $*" > /dev/kmsg 2>/dev/null
+	echo "[$(up)] $*" >> /run/kk-init.log
+}
+rd() { [ -r "$1" ] && cat "$1" 2>/dev/null || echo "-"; }
+isnum() { case "$1" in ''|*[!0-9-]*|-) return 1;; *) return 0;; esac; }
+# busybox blkid seçenek almaz: "/dev/x: LABEL="..." UUID="..." TYPE="..."" satırından alan çek
+blk_tag() { blkid "$1" 2>/dev/null | sed -n "s/.* $2=\"\([^\"]*\)\".*/\1/p"; }
+
+log "$KK_VER basladi; kernel $(uname -r)"
+log "mounts: $(grep -cE ' (proc|sysfs|devtmpfs|devpts|tmpfs|configfs) ' /proc/mounts) sanal fs bagli"
+
+# ---------------------------------------------------------------- fastboot'a dönüş
+fastboot_now() {
+	log "GUVENLIK: fastboot'a donuluyor (sebep: $1)"
+	sync
+	n=1
+	while [ $n -le 3 ]; do
+		/sbin/reboot-bl
+		log "HATA: reboot-bl donmemeliydi (deneme $n)"
+		n=$((n + 1))
+		sleep 5
+	done
+	# reboot-bl çalışmıyorsa normal reboot YAPMIYORUZ (aynı kernel'e döner, döngü olur).
+	log "HATA: reboot-bl 3 kez basarisiz; cihaz bu kernel'de kaliyor. bakımcı cihazin basina gitmeli."
+}
+
+# ---------------------------------------------------------------- kalıcı depolama (v4)
+# Yalnız PARTNAME=userdata bölümüne bakılır; etiketi kkdata olan ext4 değilse hiçbir şey
+# yapılmaz (yazma yok). Varsa: e2fsck -p (yalnız o dosya sistemi), /data'ya bağla.
+DATA_OK=0
+userdata_dev() {
+	for p in /sys/class/block/mmcblk0p*; do
+		PARTNAME=; DEVNAME=
+		. $p/uevent
+		[ "$PARTNAME" = userdata ] && { echo "$DEVNAME"; return 0; }
+	done
+	return 1
+}
+storage_setup() {
+	i=0
+	while ! UD=$(userdata_dev) && [ $i -lt 15 ]; do sleep 1; i=$((i + 1)); done
+	if [ -z "$UD" ] || [ ! -b /dev/$UD ]; then
+		log "depolama: userdata bolumu bulunamadi; RAM'de calisiliyor"
+		return 1
+	fi
+	LBL=$(blk_tag /dev/$UD LABEL)
+	TYP=$(blk_tag /dev/$UD TYPE)
+	if [ "$LBL" != "$DATA_LABEL" ] || [ "$TYP" != ext4 ]; then
+		log "depolama: /dev/$UD (userdata) etiket='${LBL:-yok}' tip='${TYP:-bilinmiyor}'; kkdata degil, baglanmadi; RAM'de calisiliyor"
+		return 1
+	fi
+	log "depolama: /dev/$UD = ext4 '$DATA_LABEL'; e2fsck -p"
+	e2fsck -p /dev/$UD >> /run/kk-init.log 2>&1
+	rc=$?
+	log "depolama: e2fsck rc=$rc"
+	if [ $rc -ge 4 ]; then
+		log "HATA: e2fsck rc=$rc (duzeltilemeyen hata); baglanmadi. Elle: e2fsck -f /dev/$UD"
+		return 1
+	fi
+	mkdir -p $DATA_MNT
+	if ! mount -t ext4 -o noatime,errors=remount-ro /dev/$UD $DATA_MNT; then
+		log "HATA: /dev/$UD $DATA_MNT'ya baglanamadi"
+		return 1
+	fi
+	mkdir -p $DATA_MNT/kk/os $DATA_MNT/kk/state $DATA_MNT/kk/logs
+	N=$(cat $DATA_MNT/kk/state/boot-count 2>/dev/null); isnum "$N" || N=0
+	N=$((N + 1)); echo $N > $DATA_MNT/kk/state/boot-count
+	BOOTDIR=$DATA_MNT/kk/logs/boot-$(printf %04d $N)
+	mkdir -p $BOOTDIR
+	# /run'daki logları taşı, yerlerine sembolik bağ koy (sonraki yazmalar kalıcı)
+	for f in kk-init.log kk-console.log kk-uptime.log kk-charge.log; do
+		[ -e /run/$f ] && cat /run/$f >> $BOOTDIR/$f
+		rm -f /run/$f
+		ln -s $BOOTDIR/$f /run/$f
+	done
+	exec >>/run/kk-console.log 2>&1 </dev/null
+	ln -sfn $BOOTDIR $DATA_MNT/kk/logs/son
+	# çekirdek logunun tamamı (açılıştan itibaren) ve sonrası. Okuyucu geride kalırsa
+	# /dev/kmsg -EPIPE verir ve cat çıkar; yeniden başlatılır (o durumda tekrar satırlar olur).
+	( while :; do cat /dev/kmsg 2>/dev/null; echo "--- kk: kmsg okuyucu yeniden basladi (uptime $(up))"; sleep 2; done ) >> $BOOTDIR/kmsg.log &
+	KMSG_PID=$!
+	# v5: 20 MB sınır, 1 eski kopya. Okuyucu O_APPEND (>>) yazdığı için kesmeden sonra
+	# dosya başından devam eder; okuyucuyu yeniden başlatmak gerekmez (tekrar satır yok).
+	( while :; do sleep 60; s=$(wc -c < $BOOTDIR/kmsg.log 2>/dev/null); isnum "$s" || continue
+	  if [ $s -gt $KMSG_MAX ]; then cp $BOOTDIR/kmsg.log $BOOTDIR/kmsg.log.1 && : > $BOOTDIR/kmsg.log
+	    echo "--- kk: kmsg.log $s bayt; kmsg.log.1'e kopyalandi ve kesildi (uptime $(up))" >> $BOOTDIR/kmsg.log; fi
+	done ) &
+	KROT_PID=$!
+	# eski log dizinlerini buda (yalnız /data/kk/logs/boot-* içinde)
+	c=$(ls -d $DATA_MNT/kk/logs/boot-* 2>/dev/null | wc -l)
+	for d in $(ls -d $DATA_MNT/kk/logs/boot-* 2>/dev/null | sort); do
+		[ $c -le $LOG_KEEP ] && break
+		case "$d" in $DATA_MNT/kk/logs/boot-[0-9]*) rm -rf "$d"; c=$((c - 1));; esac
+	done
+	DATA_OK=1
+	log "depolama: /dev/$UD $DATA_MNT'da bagli; acilis #$N, loglar $BOOTDIR ($(df -h $DATA_MNT | awk 'NR==2{print $4" bos"}'))"
+	return 0
+}
+
+# ---------------------------------------------------------------- işletim sistemi seçimi (v5)
+# Öncelik: cmdline kk.rescue=1 > /data yok > /data/kk/state/rescue > next-os != debian >
+#          init yok/çalıştırılamaz > os-tries >= OS_MAX_TRIES  → kurtarma; aksi hâlde debian.
+OS=rescue; OS_WHY=
+# yeni kök içindeki yolu (sembolik bağları kök içinde çözerek) gerçek dosyaya çevir
+resolve_in_root() {
+	r=$1; p=$2; n=0
+	while [ $n -lt 16 ]; do
+		n=$((n + 1))
+		# yolun her bileşenini sırayla çöz
+		out=; rest=${p#/}
+		while [ -n "$rest" ]; do
+			c=${rest%%/*}; [ "$rest" = "${rest#*/}" ] && rest= || rest=${rest#*/}
+			[ -z "$c" ] || [ "$c" = . ] && continue
+			if [ "$c" = .. ]; then out=${out%/*}; continue; fi
+			if [ -L "$r$out/$c" ]; then
+				t=$(readlink "$r$out/$c")
+				case "$t" in /*) p="$t${rest:+/$rest}" ;; *) p="$out/$t${rest:+/$rest}" ;; esac
+				continue 2
+			fi
+			out="$out/$c"
+		done
+		echo "$r$out"; return 0
+	done
+	return 1
+}
+choose_os() {
+	if grep -qw 'kk.rescue=1' /proc/cmdline; then OS_WHY="cmdline kk.rescue=1 (kurtarma imaji)"; return; fi
+	# G17: eRecovery yuvası (erecovery_kernel) her zaman kurtarma; bootloader bu modda
+	# "enter_recovery=1 enter_erecovery=1" ekliyor (referans bootloader create_boot_into_recovery_line).
+	if grep -qw 'enter_erecovery=1' /proc/cmdline; then OS_WHY="eRecovery modu (cmdline enter_erecovery=1)"; return; fi
+	[ $DATA_OK -eq 1 ] || { OS_WHY="/data bagli degil"; return; }
+	S=$DATA_MNT/kk/state
+	[ -e $S/rescue ] && { OS_WHY="$S/rescue var (zorla kurtarma)"; return; }
+	NEXT=$(head -n1 $S/next-os 2>/dev/null)
+	[ "$NEXT" = debian ] || { OS_WHY="next-os='${NEXT:-yok}'"; return; }
+	[ -e $OS_ROOT_DEBIAN/sbin/init ] || [ -L $OS_ROOT_DEBIAN/sbin/init ] || { OS_WHY="$OS_ROOT_DEBIAN/sbin/init yok"; return; }
+	INITF=$(resolve_in_root $OS_ROOT_DEBIAN /sbin/init)
+	{ [ -n "$INITF" ] && [ -f "$INITF" ] && [ -x "$INITF" ]; } || { OS_WHY="/sbin/init cozulemedi ya da calistirilamaz ($INITF)"; return; }
+	TRIES=$(cat $S/os-tries 2>/dev/null); isnum "$TRIES" || TRIES=0
+	[ $TRIES -ge $OS_MAX_TRIES ] && { OS_WHY="os-tries=$TRIES >= $OS_MAX_TRIES (acilis dongusu korumasi)"; return; }
+	OS=debian; OS_WHY="next-os=debian, init=${INITF#$OS_ROOT_DEBIAN}, os-tries $TRIES -> $((TRIES + 1))"
+	echo $((TRIES + 1)) > $S/os-tries; sync
+}
+# Debian'a geçiş. Başarılıysa geri dönmez. Ön koşul hatasında 1 döner (kurtarmaya devam).
+switch_to_debian() {
+	log "debian: switch_root hazirligi"
+	# önce ön koşullar (hata olursa telnet/udhcpd/kmsg okuyucu çalışır kalır)
+	mkdir -p $NEWROOT
+	if ! mount --bind $OS_ROOT_DEBIAN $NEWROOT; then log "HATA: $OS_ROOT_DEBIAN bind edilemedi"; return 1; fi
+	grep -q " $NEWROOT " /proc/mounts || { log "HATA: $NEWROOT bagli degil"; return 1; }
+	for d in data dev proc sys run; do mkdir -p $NEWROOT/$d || { log "HATA: $NEWROOT/$d"; umount $NEWROOT; return 1; }; done
+	# geri dönüşsüz kısım: initramfs'in arka plan işlerini durdur
+	killall telnetd udhcpd 2>/dev/null
+	kill $KROT_PID $KMSG_PID 2>/dev/null; pkill -f '^cat /dev/kmsg' 2>/dev/null
+	# switch_root ön koşulları (busybox switch_root başarısız olursa PID 1 ölür → panic → BFR/eRecovery)
+	[ "$$" = 1 ] || { log "HATA: PID 1 degil ($$)"; umount $NEWROOT; return 1; }
+	RT=$(stat -f -c %T / 2>/dev/null)
+	case "$RT" in ramfs|tmpfs) ;; *) log "HATA: kok dosya sistemi '$RT' (ramfs/tmpfs degil)"; umount $NEWROOT; return 1;; esac
+	log "debian: /data /dev /proc /sys yeni koke tasiniyor; switch_root $NEWROOT /sbin/init"
+	sync
+	# v5.1 (Görev 15): bu kernel'de /dev/console açılamıyor ("unable to open an initial
+	# console"). v5'te 'exec </dev/console' yönlendirme hatası PID 1'i öldürüp panic'e yol
+	# açtı. Önce alt kabukta dene; açılamıyorsa /dev/null.
+	if ( : </dev/console >/dev/console ) 2>/dev/null; then
+		exec </dev/console >/dev/console 2>&1
+	else
+		exec </dev/null >/dev/null 2>&1
+	fi
+	# Buradan sonrası geri dönüşsüz: bir adım başarısız olursa switch_root YAPILMAZ,
+	# normal reboot (os-tries sayacı 3 denemeden sonra kurtarmaya düşürür). PID 1 ölmez.
+	KM=/dev/kmsg
+	mvfail() { echo "<3>kk: HATA: $1; switch_root yapilmiyor, normal reboot (os-tries)" > $KM 2>/dev/null; sync; reboot -f; while :; do sleep 60; done; }
+	mount --move $DATA_MNT $NEWROOT/data || mvfail "mount --move $DATA_MNT"
+	mount --move /dev  $NEWROOT/dev   || mvfail "mount --move /dev"
+	KM=$NEWROOT/dev/kmsg
+	mount --move /proc $NEWROOT/proc  || mvfail "mount --move /proc"
+	mount --move /sys  $NEWROOT/sys   || mvfail "mount --move /sys"
+	umount -l /run 2>/dev/null
+	echo "<6>kk: debian: exec switch_root $NEWROOT /sbin/init" > $KM 2>/dev/null
+	exec switch_root $NEWROOT /sbin/init
+}
+
+# ---------------------------------------------------------------- G63: oturum zamanlayicisi (v5.2e)
+# telnet (23) uzerinde kurulu (ESTABLISHED) baglanti var mi: /proc/net/tcp yerel port 0017, durum 01
+telnet_oturum_var() { awk 'NR>1 && $2 ~ /:0017$/ && $4 == "01" { f=1 } END { exit f ? 0 : 1 }' /proc/net/tcp 2>/dev/null; }
+# Debian'a otomatik gecis denemesi. Basarili olursa geri donmez. Donerse sebep OTO_RED'dedir (kurtarmada kalinir).
+# Kural 18 uyumu: p43/p40'a YAZMA yok; yalniz p68'deki 4.9 Debian'a switch_root. Kapi profil 2 -> 3 daraltilir.
+oto_debian_dene() {
+	OTO_RED=
+	[ $DATA_OK -eq 1 ] || { OTO_RED="/data bagli degil"; return 1; }
+	S=$DATA_MNT/kk/state
+	[ -e $S/rescue ] && { OTO_RED="$S/rescue var (zorla kurtarma)"; return 1; }
+	[ -e $OS_ROOT_DEBIAN/sbin/init ] || [ -L $OS_ROOT_DEBIAN/sbin/init ] || { OTO_RED="$OS_ROOT_DEBIAN/sbin/init yok"; return 1; }
+	INITF=$(resolve_in_root $OS_ROOT_DEBIAN /sbin/init)
+	{ [ -n "$INITF" ] && [ -f "$INITF" ] && [ -x "$INITF" ]; } || { OTO_RED="debian init cozulemedi"; return 1; }
+	# dongu siniri (ardisik; telnet oturumu gorulunce sifirlanir)
+	A=$(cat $S/erec-oto.say 2>/dev/null); isnum "$A" || A=0
+	[ $A -ge $OTO_ARDISIK_MAX ] && { OTO_RED="ardisik otomatik gecis $A >= $OTO_ARDISIK_MAX"; return 1; }
+	# 24 saat siniri (saat guvenilirse)
+	NOWS=$(date +%s 2>/dev/null); isnum "$NOWS" || NOWS=0
+	if [ $NOWS -gt 1700000000 ]; then
+		K=0; for t in $(cat $S/erec-oto.zaman 2>/dev/null); do isnum "$t" && [ $((NOWS - t)) -lt 86400 ] && K=$((K + 1)); done
+		[ $K -ge $OTO_GUN_MAX ] && { OTO_RED="24 saatte $K gecis >= $OTO_GUN_MAX"; return 1; }
+	fi
+	# kapi acik ve profil 2 olmali; daralt (2 -> 3) basarisizsa gecme (Debian'in p68 yazmasi garanti degil)
+	[ "$(cut -d' ' -f1 $OTO_KAPI/durum 2>/dev/null)" = ACIK ] || { OTO_RED="eMMC kapisi ACIK degil ($(cat $OTO_KAPI/durum 2>/dev/null))"; return 1; }
+	echo 1 > $OTO_KAPI/daralt 2>/dev/null
+	[ "$(cat $OTO_KAPI/profil 2>/dev/null)" = 3 ] || { OTO_RED="kapi profili 3'e inmedi ($(cat $OTO_KAPI/profil 2>/dev/null))"; return 1; }
+	# os-tries artir (choose_os ile ayni koruma); sayaclari yaz, sync, sonra gec
+	TR=$(cat $S/os-tries 2>/dev/null); isnum "$TR" || TR=0
+	[ $TR -ge $OS_MAX_TRIES ] && { OTO_RED="os-tries=$TR >= $OS_MAX_TRIES"; return 1; }
+	echo $((TR + 1)) > $S/os-tries
+	echo $((A + 1)) > $S/erec-oto.say
+	[ $NOWS -gt 1700000000 ] && echo $NOWS >> $S/erec-oto.zaman
+	sync
+	log "oturum zamanlayicisi: $OTO_SURE sn icinde telnet oturumu yok; 4.9 Debian'a geciliyor (ardisik $((A + 1)), os-tries $((TR + 1)), kapi profil 3)"
+	OS=debian
+	switch_to_debian && return 0
+	log "HATA: otomatik debian gecisi basarisiz (kurtarmada devam)"
+	OTO_RED="switch_to_debian on kosul hatasi"
+	return 1
+}
+
+# ---------------------------------------------------------------- şarj limiti (v4)
+clog() {
+	echo "<6>kk: sarj: $*" > /dev/kmsg 2>/dev/null
+	echo "[$(up)] $*" >> /run/kk-charge.log
+}
+charge_step() {
+	if [ ! -e "$CHG_NODE" ]; then
+		[ "$CHG_MISSING" = 1 ] || clog "$CHG_NODE yok; sarj limiti yalnizca loglaniyor"
+		CHG_MISSING=1; return
+	fi
+	[ "$CHG_MISSING" = 1 ] && clog "$CHG_NODE artik var"
+	CHG_MISSING=0
+	cap=$(rd $BAT/capacity); bt=$(rd $BAT/temp); cur=$(rd $CHG_NODE)
+	want=; why=
+	if isnum "$bt"; then
+		if [ $bt -ge $CHG_HOT ]; then
+			[ "$CHG_HOTST" = 1 ] || clog "pil sicak (temp=$bt >= $CHG_HOT)"
+			CHG_HOTST=1
+		elif [ "$CHG_HOTST" = 1 ] && [ $bt -lt $CHG_COOL ]; then
+			CHG_HOTST=0
+			clog "pil sogudu (temp=$bt < $CHG_COOL); normal kurala donuluyor"
+			# sıcaklık molasından sonra: üst eşiğin altındaysak şarja devam
+			isnum "$cap" && [ $cap -lt $CHG_HI ] && { want=1; why="soguma-sonrasi"; }
+		fi
+	fi
+	if [ "$CHG_HOTST" = 1 ]; then
+		want=0; why="sicak"
+	elif [ -z "$want" ]; then
+		if ! isnum "$cap"; then
+			[ "$CHG_NOCAP" = 1 ] || clog "capacity okunamadi ($cap); islem yok"
+			CHG_NOCAP=1; return
+		fi
+		CHG_NOCAP=0
+		if [ $cap -ge $CHG_HI ]; then want=0; why="ust-esik"
+		elif [ $cap -le $CHG_LO ]; then want=1; why="alt-esik"
+		fi
+	fi
+	if [ -n "$want" ] && [ "$want" != "$cur" ]; then
+		echo $want > $CHG_NODE 2>/dev/null; rc=$?
+		clog "enable_charger $cur -> $want ($why; cap=$cap temp=$bt) yazma rc=$rc, okunan=$(rd $CHG_NODE)"
+	elif [ "$1" = ilk ]; then
+		clog "acilis: enable_charger=$cur cap=$cap temp=$bt; ${want:+hedef $want ($why) zaten ayni}${want:-bant ici ($CHG_LO<cap<$CHG_HI), mevcut deger korunuyor}"
+	fi
+}
+charge_loop() {
+	CHG_MISSING=0; CHG_HOTST=0; CHG_NOCAP=0
+	clog "sarj limiti basladi: >=${CHG_HI}% kapat, <=${CHG_LO}% ac, pil>=${CHG_HOT} kapat / <${CHG_COOL} normal; ${CHG_EVERY} sn"
+	charge_step ilk
+	while :; do
+		sleep $CHG_EVERY
+		charge_step
+	done
+}
+
+# ---------------------------------------------------------------- USB gadget
+usb_setup() {
+	DR=/sys/class/dual_role_usb/otg_default/mode
+	if [ -e "$DR" ]; then
+		log "dual_role mode once: $(rd $DR)"
+		echo device > "$DR" 2>/dev/null || log "UYARI: dual_role'e 'device' yazilamadi"
+		sleep 1
+		log "dual_role mode sonra: $(rd $DR)"
+	else
+		log "UYARI: $DR yok"
+	fi
+
+	i=0
+	while [ ! -e /sys/class/udc/$UDC ] && [ $i -lt 30 ]; do sleep 1; i=$((i + 1)); done
+	if [ ! -e /sys/class/udc/$UDC ]; then
+		log "HATA: UDC $UDC yok (mevcut: $(ls /sys/class/udc 2>&1 | tr '\n' ' '))"
+		return 1
+	fi
+	log "UDC $UDC hazir (${i} sn beklendi)"
+
+	if [ ! -d /sys/kernel/config/usb_gadget ]; then
+		log "HATA: configfs usb_gadget yok"
+		return 1
+	fi
+	mkdir -p $G || { log "HATA: $G olusturulamadi"; return 1; }
+	echo 0x1d6b > $G/idVendor          # Linux Foundation
+	echo 0x0104 > $G/idProduct         # Multifunction Composite Gadget
+	echo 0x0100 > $G/bcdDevice
+	echo 0x0200 > $G/bcdUSB
+	mkdir -p $G/strings/0x409
+	echo "KK-ANAHAT" > $G/strings/0x409/serialnumber
+	echo "Kara Kutu"           > $G/strings/0x409/manufacturer
+	echo "$KK_VER"             > $G/strings/0x409/product
+	mkdir -p $G/configs/c.1/strings/0x409
+	echo "kk-net" > $G/configs/c.1/strings/0x409/configuration
+	echo 250 > $G/configs/c.1/MaxPower
+
+	FUNC=
+	for f in ncm.usb0 rndis.usb0; do
+		if mkdir $G/functions/$f 2>/dev/null; then FUNC=$f; break; fi
+		log "UYARI: $f olusturulamadi"
+	done
+	[ -n "$FUNC" ] || { log "HATA: ne NCM ne RNDIS fonksiyonu olusturulabildi"; return 1; }
+	echo $MAC_DEV  > $G/functions/$FUNC/dev_addr  2>/dev/null
+	echo $MAC_HOST > $G/functions/$FUNC/host_addr 2>/dev/null
+	ln -s $G/functions/$FUNC $G/configs/c.1/ || { log "HATA: $FUNC config'e baglanamadi"; return 1; }
+
+	echo $UDC > $G/UDC || { log "HATA: gadget UDC'ye baglanamadi"; return 1; }
+	sleep 1
+	# v4.1: "USB kuruldu" = gadget UDC'ye bağlı (host takılı olmasa da; şarj adaptörüyle de).
+	# Bundan sonraki hatalar 2 döndürür (gadget bağlı, ağ eksik); karar ana akışta.
+	[ "$(rd $G/UDC)" = "$UDC" ] || { log "HATA: $G/UDC='$(rd $G/UDC)' (beklenen $UDC)"; return 1; }
+	log "gadget UDC'ye bagli: $UDC (UDC state $(rd /sys/class/udc/$UDC/state); host baglantisi karara girmez)"
+	IFN=$(rd $G/functions/$FUNC/ifname)
+	[ -n "$IFN" ] && [ "$IFN" != "-" ] && [ -e /sys/class/net/$IFN ] || IFN=usb0
+	[ -e /sys/class/net/$IFN ] || { log "HATA: ag arayuzu yok ($FUNC, ifname=$IFN)"; return 2; }
+	log "gadget: $FUNC, arayuz $IFN, UDC state $(rd /sys/class/udc/$UDC/state)"
+
+	ifconfig $IFN $IP_DEV netmask 255.255.255.0 up || { log "HATA: $IFN IP alamadi"; return 2; }
+
+	cat > /run/udhcpd.conf <<-EOF
+	interface $IFN
+	start $IP_HOST
+	end $IP_HOST
+	max_leases 1
+	lease_file /run/udhcpd.leases
+	option subnet 255.255.255.0
+	option lease 3600
+	EOF
+	touch /run/udhcpd.leases
+	udhcpd /run/udhcpd.conf || log "UYARI: udhcpd baslamadi (ana makine statik IP ile yine baglanabilir)"
+	telnetd -b $IP_DEV:23 -l /bin/sh || { log "HATA: telnetd baslamadi"; return 2; }
+	log "USB ag hazir: $IP_DEV/24 ($IFN), udhcpd -> $IP_HOST, telnetd $IP_DEV:23"
+	return 0
+}
+
+# ---------------------------------------------------------------- rapor
+report() {
+	R=/run/kk-report.txt
+	{
+	echo "===== $KK_VER"
+	echo "uptime: $(cat /proc/uptime)"
+	echo
+	echo "===== uname";   uname -a
+	echo "===== cmdline"; cat /proc/cmdline
+	echo
+	echo "===== batarya / guc kaynaklari (sadece okuma)"
+	for d in /sys/class/power_supply/*; do
+		echo "-- $d"
+		for f in type online present status health capacity temp voltage_now current_now charge_type; do
+			[ -r $d/$f ] && echo "   $f=$(cat $d/$f 2>/dev/null)"
+		done
+	done
+	echo "-- sarj dugumleri (v4: charge_data/enable_charger sarj limiti dongusunce yonetilir; bkz /run/kk-charge.log)"
+	for f in /sys/devices/platform/huawei_charger/enable_charger \
+	         /sys/class/hw_power/interface/enable_charger \
+	         /sys/class/hw_power/charger/charge_data/enable_charger; do
+		if [ -e $f ]; then echo "   $f=$(rd $f)"; else echo "   $f YOK"; fi
+	done
+	echo
+	echo "===== bolumler (by-name)"
+	for p in /sys/class/block/mmcblk0p*; do
+		PARTNAME=; DEVNAME=
+		. $p/uevent
+		echo "$DEVNAME $PARTNAME $(( $(cat $p/size) / 2048 ))MB"
+	done
+	echo "-- /proc/partitions"; cat /proc/partitions
+	echo
+	echo "===== Wi-Fi / Hi1102 (sadece listeleme, init yapilmadi)"
+	echo "-- /sys/hisys/boot:"; ls -la /sys/hisys/boot 2>&1
+	echo "-- /sys/module (hi110x/plat/wifi):"; ls /sys/module 2>/dev/null | grep -iE 'hi110|plat|wifi|wlan|bfg|oal|oam' | tr '\n' ' '; echo
+	echo "-- ag arayuzleri:"; ip -o link 2>&1
+	echo "-- dmesg (hi110x/wifi/wlan/bfg):"; dmesg | grep -iE 'hi110|wifi|wlan|bfg|hisi_conn|connectivity' | tail -40
+	echo
+	echo "===== USB"
+	echo "dual_role mode: $(rd /sys/class/dual_role_usb/otg_default/mode)"
+	echo "UDC: $(ls /sys/class/udc 2>&1 | tr '\n' ' ') state: $(rd /sys/class/udc/$UDC/state)"
+	echo "gadget UDC: $(rd $G/UDC)  fonksiyonlar: $(ls $G/functions 2>&1 | tr '\n' ' ')"
+	ip addr 2>&1
+	echo
+	echo "===== watchdog"
+	ls -l /dev/watchdog* 2>&1
+	dmesg | grep -iE 'watchdog|wdt|sp805' | tail -20
+	echo
+	echo "===== DT initrd (bilgi)"
+	od -An -tx1 /proc/device-tree/chosen/linux,initrd-start /proc/device-tree/chosen/linux,initrd-end 2>&1
+	echo
+	echo "===== bellek / cpu / sicaklik"
+	head -3 /proc/meminfo; echo "cpu: $(grep -c ^processor /proc/cpuinfo)"
+	for z in /sys/class/thermal/thermal_zone*; do echo "$(rd $z/type)=$(rd $z/temp)"; done 2>/dev/null | head -20
+	echo
+	echo "===== depolama (v4)"
+	echo "userdata: /dev/$(userdata_dev) $(blkid /dev/$(userdata_dev) 2>&1)"
+	echo "kalici: DATA_OK=$DATA_OK ${BOOTDIR:+loglar $BOOTDIR}; mod=$MODE (keep bayragi: $DATA_MNT/kk/state/keep)"
+	echo "os: $OS ($OS_WHY); next-os=$(cat $DATA_MNT/kk/state/next-os 2>/dev/null) os-tries=$(cat $DATA_MNT/kk/state/os-tries 2>/dev/null) rescue=$([ -e $DATA_MNT/kk/state/rescue ] && echo var || echo yok)"
+	df -h $DATA_MNT 2>&1 | tail -1
+	echo "araclar: $(ls /sbin/mke2fs /sbin/e2fsck /sbin/resize2fs /sbin/dumpe2fs /sbin/kk-format-data 2>&1 | tr '\n' ' ')"
+	echo
+	echo "===== mounts"; cat /proc/mounts
+	echo
+	echo "===== dmesg: error/fail/panic/warn (son 80)"
+	dmesg | grep -iE 'error|fail|panic|warn|oops|bug:' | tail -80
+	} > $R 2>&1
+	dmesg > /run/kk-dmesg-$(cut -d. -f1 /proc/uptime).txt 2>&1
+	log "rapor yazildi: $R ($(wc -c < $R) bayt)"
+}
+
+# ---------------------------------------------------------------- ana akış
+storage_setup                    # kkdata varsa /data + kalıcı loglar; yoksa RAM
+choose_os                        # v5: debian ya da kurtarma
+log "os secimi: $OS ($OS_WHY)"
+if [ $OS = rescue ]; then
+	charge_loop &                # şarj limiti, arka planda (v4); Debian'da systemd servisi
+	log "sarj limiti dongusu baslatildi (pid $!)"
+fi
+# v4.1 güvenlik anahtarı politikası (Görev 14):
+#   bakım modu  (/data/kk/state/keep yok ya da /data bağlı değil): v4 ile aynı
+#               (gadget bağlanamazsa FAIL_DELAY sn, kk-keep gelmezse KEEP_TIMEOUT sn → reboot-bl)
+#   kalıcı mod  (/data/kk/state/keep var): otomatik fastboot YOK, yalnız log;
+#               fastboot'a dönüş elle (telnet'ten reboot-bl ya da tuşla)
+MODE=bakim
+[ $DATA_OK -eq 1 ] && [ -e $DATA_MNT/kk/state/keep ] && MODE=kalici
+log "mod: $MODE ($( [ $MODE = kalici ] && echo "$DATA_MNT/kk/state/keep var; otomatik fastboot yok" || echo "keep bayragi yok ya da /data bagli degil; guvenlik anahtari etkin"))"
+
+usb_setup
+URC=$?
+case $URC in
+	0) USB_OK=1 ;;
+	2) USB_OK=1; log "UYARI: gadget UDC'ye bagli ama ag kurulumu eksik (telnet olmayabilir)" ;;
+	*) USB_OK=0 ;;
+esac
+report
+
+if [ $OS = debian ]; then
+	switch_to_debian
+	# buraya yalnız ön koşul hatasında gelinir
+	log "HATA: debian'a gecilemedi; kurtarma ortaminda devam (os-tries artmis kaldi)"
+	OS=rescue
+	charge_loop &
+	log "sarj limiti dongusu baslatildi (pid $!)"
+fi
+
+if [ $USB_OK -ne 1 ]; then
+	if [ $MODE = kalici ]; then
+		log "USB gadget UDC'ye baglanamadi; kalici mod: otomatik fastboot YOK (yalniz log)"
+	else
+		log "USB gadget UDC'ye baglanamadi; ${FAIL_DELAY} sn sonra fastboot"
+		sleep $FAIL_DELAY
+		fastboot_now "usb-kurulamadi"
+	fi
+fi
+
+START=$(cut -d. -f1 /proc/uptime)
+DEADLINE=$((START + KEEP_TIMEOUT))
+if [ $MODE = kalici ]; then
+	KEPT=3   # kalıcı mod: zaman aşımı yok
+	log "guvenlik anahtari: kalici mod, devre disi (fastboot yalniz elle: reboot-bl ya da tus)"
+else
+	KEPT=0
+	log "guvenlik anahtari: uptime $DEADLINE sn'ye kadar /run/kk-keep bekleniyor (touch /run/kk-keep)"
+fi
+LAST=0
+OTO_GORULDU=0; OTO_DENENDI=0
+ERECMOD=0; grep -qw 'enter_erecovery=1' /proc/cmdline && ERECMOD=1
+while :; do
+	NOW=$(cut -d. -f1 /proc/uptime)
+	# G63: oturum zamanlayicisi (yalniz eRecovery yuvasi = v5.2e)
+	if [ $ERECMOD -eq 1 ] && [ $OTO_GORULDU -eq 0 ]; then
+		if telnet_oturum_var; then
+			OTO_GORULDU=1
+			[ $DATA_OK -eq 1 ] && { echo 0 > $DATA_MNT/kk/state/erec-oto.say 2>/dev/null; sync; }
+			log "telnet oturumu goruldu (uptime $NOW); oturum zamanlayicisi devre disi, ardisik sayac sifirlandi"
+		elif [ $OTO_DENENDI -eq 0 ] && [ $((NOW - START)) -ge $OTO_SURE ]; then
+			OTO_DENENDI=1
+			oto_debian_dene || log "oturum zamanlayicisi: gecilmedi ($OTO_RED); kurtarmada kaliniyor"
+		fi
+	fi
+	if [ $KEPT -eq 0 ]; then
+		if [ -e /run/kk-keep ]; then
+			KEPT=1
+			log "kk-keep goruldu (uptime $NOW); guvenlik anahtari devre disi"
+		elif [ $NOW -ge $DEADLINE ]; then
+			# G63: USB host yok (UDC configured degil) ve zamanlayici henuz denememisse fastboot'a gitme
+			# (adaptorde Wi-Fi'den ulasilabilir kalmak icin 4.9 Debian'a gecis OTO_SURE'de denenir)
+			if [ $ERECMOD -eq 1 ] && [ $OTO_GORULDU -eq 0 ] && [ $OTO_DENENDI -eq 0 ] && [ "$(rd /sys/class/udc/$UDC/state)" != configured ]; then
+				:
+			else
+				log "kk-keep yok, sure doldu (uptime $NOW)"
+				fastboot_now "kk-keep-zaman-asimi"
+				KEPT=2   # reboot-bl başarısızsa tekrar denemeyi bırak, logla
+			fi
+		fi
+	fi
+	if [ $((NOW - LAST)) -ge $UPTIME_EVERY ]; then
+		LAST=$NOW
+		# Görev 11: akım/voltaj ve SoC sıcaklığı da (sadece okuma; şarja dokunulmaz)
+		BT=$(rd $BAT/temp); ST=$(rd /sys/class/thermal/thermal_zone0/temp)
+		L="uptime=$NOW bat=$(rd $BAT/capacity)% status=$(rd $BAT/status) temp=$BT cur=$(rd $BAT/current_now) volt=$(rd $BAT/voltage_now) soc=$ST usb=$(rd /sys/class/udc/$UDC/state) keep=$KEPT mod=$MODE"
+		echo "[$(up)] $L" >> /run/kk-uptime.log
+		echo "<6>kk: $L" > /dev/kmsg 2>/dev/null
+		# sıcaklık uyarısı (v4: SoC 55 °C, pil 42 °C): yalnız uyarı
+		if { [ "$BT" -ge $WARN_BAT ] 2>/dev/null; } || { [ "$ST" -ge $WARN_SOC ] 2>/dev/null; }; then
+			echo "[$(up)] UYARI SICAK: pil=$BT soc=$ST" >> /run/kk-uptime.log
+			echo "<4>kk: UYARI SICAK: pil=$BT soc=$ST (esik pil $WARN_BAT, soc $WARN_SOC)" > /dev/kmsg 2>/dev/null
+		fi
+	fi
+	sleep 5
+done

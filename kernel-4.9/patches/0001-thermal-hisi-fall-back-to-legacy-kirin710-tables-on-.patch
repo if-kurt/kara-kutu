@@ -1,0 +1,135 @@
+From 79d5300f2d3ea382590bfdce541f6ed6e15198c3 Mon Sep 17 00:00:00 2001
+From: Kara Kutu <kk@localhost>
+Date: Mon, 9 Nov 2026 19:15:51 +0000
+Subject: [PATCH 1/3] thermal: hisi: fall back to legacy kirin710 tables on
+ EMUI 9 DTs
+
+P30 lite (MAR) EMUI 9 device trees have no ipa_sensors_info node and no
+hisi,tsensor_name / hisi,tsensor_mode properties; the stock 4.9.111 kernel
+used fixed tables instead.
+
+- hisi_ipa_thermal: without ipa_sensors_info, of_parse_ipa_sensor_index_table()
+  returned -ENODEV, thermal_init() unregistered thermal_class and the next
+  thermal_zone_device_register() (power_tz_probe) spun on a dead spinlock
+  ("spinlock bad magic", soft lockup, FIQ panic, LPM3 reset). Use the kirin710
+  layout (2 clusters: cpu0-3, cpu4-7; actors cluster0/cluster1/gpu).
+- hisi_tsens: use the legacy sensor name table (cluster0, cluster1, gpu,
+  modem, ddr; matches hisi,detect_<name>_regno) when the DT has no names;
+  clear g_tmdev when probe fails (it pointed to freed devm memory) and
+  guard tsens_get_temp()/ipa_get_tsensor_id() against NULL.
+
+---
+ drivers/thermal/hisi/hisi_ipa_thermal.c | 21 ++++++++++++++++--
+ drivers/thermal/hisi/hisi_tsens.c       | 29 +++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/thermal/hisi/hisi_ipa_thermal.c b/drivers/thermal/hisi/hisi_ipa_thermal.c
+index 5a2fc378c..fb29c6359 100755
+--- a/drivers/thermal/hisi/hisi_ipa_thermal.c
++++ b/drivers/thermal/hisi/hisi_ipa_thermal.c
+@@ -905,8 +905,25 @@ int of_parse_ipa_sensor_index_table(void)
+ 
+ 	np = of_find_node_by_name(NULL, "ipa_sensors_info");
+ 	if (!np) {
+-		pr_err("ipa_sensors_info node not found\n");
+-		return -ENODEV;
++		/*
++		 * kk (Kara Kutu): EMUI 9 kirin710 DTs (P30 lite / MAR) have no
++		 * ipa_sensors_info node; the stock 4.9.111 kernel used fixed tables.
++		 * Returning an error here makes thermal_init() unregister
++		 * thermal_class, and the next thermal_zone_device_register()
++		 * (power_tz_probe) spins forever on a dead spinlock (Görev 7).
++		 * Use the kirin710 layout instead: 2 clusters (cpu0-3, cpu4-7) + gpu.
++		 */
++		pr_warn("kk: ipa_sensors_info node not found, using legacy kirin710 tables\n");
++		g_cluster_num = 2;
++		g_ipa_sensor_num = 3;
++		ipa_actor_name[0] = "cluster0";
++		ipa_actor_name[1] = "cluster1";
++		ipa_actor_name[2] = "gpu";
++		for (i = 0; i < (int)g_ipa_sensor_num; i++)
++			ipa_actor_index[i] = (u32)i;
++		ipa_cpufreq_table_index[0] = 0;
++		ipa_cpufreq_table_index[1] = 4;
++		return 0;
+ 	}
+ 
+ 	ret = of_property_read_u32(np, "hisilicon,cluster_num", &g_cluster_num);
+diff --git a/drivers/thermal/hisi/hisi_tsens.c b/drivers/thermal/hisi/hisi_tsens.c
+index b7e48b2fc..4c2df04bf 100755
+--- a/drivers/thermal/hisi/hisi_tsens.c
++++ b/drivers/thermal/hisi/hisi_tsens.c
+@@ -35,6 +35,10 @@ static struct tsens_tm_device	*g_tmdev;
+ const char *hisi_tsensor_name[CAPACITY_OF_TSENSOR_ARRAY];
+ u32 hisi_tsensor_mode[CAPACITY_OF_TSENSOR_ARRAY];
+ EXPORT_SYMBOL_GPL(hisi_tsensor_name);
++/* kk: sensor order of the EMUI 9 kirin710 DT ("hisi,detect_<name>_regno") */
++static const char * const kk_legacy_tsensor_name[] = {
++	"cluster0", "cluster1", "gpu", "modem", "ddr",
++};
+ 
+ /* Trips: warm and cool */
+ enum tsens_trip_type {
+@@ -171,6 +175,9 @@ int tsens_get_temp(u32 sensor, int *temp)
+ 	int ret = -EINVAL;
+ 	int tmp = 0;
+ 
++	if (!g_tmdev)	/* kk: tsens probe failed */
++		return -ENODEV;
++
+ 	for (i = 0; i < g_tmdev->tsens_num_sensor; i++) {
+ 		if (sensor == g_tmdev->sensor[i].sensor_num) {
+ 			thermal = g_tmdev->sensor[i].tz_dev;
+@@ -189,6 +196,9 @@ int ipa_get_tsensor_id(const char *name)
+ 	int ret = -ENODEV;
+ 	int id = 0;
+ 
++	if (!g_tmdev)	/* kk: tsens probe failed */
++		return ret;
++
+ 	pr_info("IPA tsensor_num =%d\n", g_tmdev->tsens_num_sensor);
+ 	if (name == NULL) {
+ 		pr_err("%s:name == NULL!\n", __func__);
+@@ -337,6 +347,22 @@ static int get_device_tree_data(struct platform_device *pdev)
+ 
+ 	g_tmdev->tsens_num_sensor = tsens_num_sensors;
+ 
++	/*
++	 * kk (Kara Kutu): EMUI 9 DTs (P30 lite / MAR) have no "hisi,tsensor_name"
++	 * and "hisi,tsensor_mode"; the stock 4.9.111 kernel used a fixed table and
++	 * the per-sensor "hisi,detect_<name>_regno" properties, which these DTs
++	 * do carry. Fall back to that table instead of failing the probe.
++	 */
++	if (of_property_count_strings(of_node, "hisi,tsensor_name") < 0 &&
++	    tsens_num_sensors <= (int)ARRAY_SIZE(kk_legacy_tsensor_name)) {
++		dev_warn(dev, "kk: no hisi,tsensor_name, using legacy kirin710 table\n");
++		for (i = 0; i < tsens_num_sensors; i++) {
++			hisi_tsensor_name[i] = kk_legacy_tsensor_name[i];
++			hisi_tsensor_mode[i] = THERMAL_DEVICE_ENABLED;
++		}
++		goto kk_names_done;
++	}
++
+ 	for (i = 0; i < tsens_num_sensors; i++) {
+ 		rc =  of_property_read_string_index(of_node, "hisi,tsensor_name", i, &hisi_tsensor_name[i]); /*lint !e605*/
+ 		if (rc) {
+@@ -352,6 +378,7 @@ static int get_device_tree_data(struct platform_device *pdev)
+ 		pr_err("%s hisi_tsensor_mode read err\n", __func__);
+ 		goto dt_parse_common_end;
+ 	}
++kk_names_done:
+ 
+ 	rc = (u32)of_property_read_u32(of_node, "hisi,tsensor_adc_start_value", &register_info);
+ 	if (rc) {
+@@ -399,6 +426,8 @@ static int tsens_tm_probe(struct platform_device *pdev)
+ 		rc = get_device_tree_data(pdev);
+ 		if (rc) {
+ 			dev_err(&pdev->dev, "Error reading TSENS DT\n");
++			/* kk: g_tmdev is devm memory, freed when probe fails */
++			g_tmdev = NULL;
+ 			return rc;
+ 		}
+ 	} else
+-- 
+2.43.0
+

@@ -1,0 +1,53 @@
+--- a/init/initramfs.c
++++ b/init/initramfs.c
+@@ -613,6 +613,11 @@
+ {
+ 	if (*str)
+ 		return 0;
++#ifdef CONFIG_KK_IGNORE_EXTERNAL_INITRD
++	/* Kara Kutu: gömülü initramfs her zaman kullanılır. */
++	pr_info("kk: skip_initramfs yok sayildi (gomulu initramfs kullaniliyor)\n");
++	return 1;
++#endif
+ 	do_skip_initramfs = 1;
+ 	return 1;
+ }
+@@ -631,6 +636,19 @@
+ 	err = unpack_to_rootfs(__initramfs_start, __initramfs_size);
+ 	if (err)
+ 		panic("%s", err); /* Failed to decompress INTERNAL initramfs */
++#ifdef CONFIG_KK_IGNORE_EXTERNAL_INITRD
++	/*
++	 * Kara Kutu: bootloader eRecovery/recovery modunda bölümlerdeki ramdisk'leri
++	 * (erecovery_ramdisk + erecovery_vendor ya da recovery_ramdisk) initrd olarak
++	 * veriyor; açılırsa gömülü /init'in üstüne yazılır. Açmadan bırak.
++	 */
++	if (initrd_start) {
++		pr_info("kk: bootloader initrd yok sayildi (%lu bayt @ 0x%lx)\n",
++			initrd_end - initrd_start, initrd_start);
++		free_initrd();
++	}
++	return 0;
++#endif
+ 	if (initrd_start) {
+ #ifdef CONFIG_BLK_DEV_RAM
+ 		int fd;
+--- a/init/Kconfig
++++ b/init/Kconfig
+@@ -1539,6 +1539,16 @@
+ 
+ 	  If unsure, say N.
+ 
++config KK_IGNORE_EXTERNAL_INITRD
++	bool "Kara Kutu: bootloader initrd'sini yok say (yalniz gomulu initramfs)"
++	depends on BLK_DEV_INITRD
++	default n
++	help
++	  Bootloader'in verdigi initrd (linux,initrd-start/end) acilmaz ve
++	  skip_initramfs parametresi yok sayilir; yalniz CONFIG_INITRAMFS_SOURCE
++	  ile gomulen initramfs kullanilir. eRecovery yuvasinda calisan kurtarma
++	  kernel'i icin.
++
+ config BLK_DEV_INITRD
+ 	bool "Initial RAM filesystem and RAM disk (initramfs/initrd) support"
+ 	depends on BROKEN || !FRV
