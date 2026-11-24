@@ -39,6 +39,7 @@ Working research project, not an installer.
 | `tools/qemu/` | QEMU VM slot helper used for regression runs |
 | `initramfs/` | Early-boot scripts embedded in the kernel image: `init`, write gate (`kk-alan`), health watchdog (`kk-saglik`), idle watchdog, zram setup, Wi-Fi firmware loader and watchdog, rescue shell helper |
 | `wifi/` | Wi-Fi watchdog and event helpers for the 4.9 Debian side |
+| `tools/fetch-hi1102-files.sh` | Copies the Hi1102 Wi-Fi firmware and config INI from your own device's vendor partition (read-only mount), with sizes and SHA256SUMS; the kernel embeds them at build time (`CONFIG_KK_HI1102_FW_DIR`, `CONFIG_KK_HI1102_INI`) |
 | `postmarketos/` | Local postmarketOS recipe (`device-huawei-marie`, `linux-huawei-marie`) for use with your own pmaports checkout; not bootable yet, see `postmarketos/KNOWN-GAPS.md` |
 
 Documentation is in Turkish; the safety summary below and the header of `docs/guvenlik-tasarimi.md` are in English.
@@ -74,6 +75,8 @@ The scripts expect to live in `/opt/kara-kutu/tools/kk-bin` (see the install gui
 ## Not included
 
 Stock images and backups, vendor firmware (bootloader, Wi-Fi/Bluetooth firmware), raw logs and dumps, per-device identity data. Make your own backup of every partition before using this on a device.
+
+The Hi1102 Wi-Fi firmware and its config INI are in neither repository. Take them from your own phone with `tools/fetch-hi1102-files.sh` (read-only) and point the kernel build at them (`CONFIG_KK_HI1102_FW_DIR` = that directory, `CONFIG_KK_HI1102_INI` = the INI file in it).
 
 ## License
 
